@@ -1,6 +1,6 @@
 # Millenniallity Volatility Mismatch Scanner
 
-Streamlit app: volatile equities where forward P/E diverges from peers, sector context, and 10-K narrative (xAI). See `app.py` for details.
+Streamlit app: auto-discovers volatile equities where forward P/E diverges from peers / sector and runs a 10-K narrative check via **xAI**. Keys are read **only** from `.env` / environment (nothing is typed in the UI).
 
 ## Setup
 
