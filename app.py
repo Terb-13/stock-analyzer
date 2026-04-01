@@ -63,8 +63,6 @@ DEFAULT_TICKERS_BY_SECTOR: dict[str, list[str]] = {
     "Energy/Shipping": ["CNQ", "ZIM"],
 }
 
-DEFAULT_TICKERS: list[str] = sorted({t for ts in DEFAULT_TICKERS_BY_SECTOR.values() for t in ts})
-
 SECTOR_PE_BENCHMARK: dict[str, float] = {
     "Autos/EV": 18.0,
     "AI/Tech": 28.0,
@@ -77,6 +75,7 @@ FMP_BASE = "https://financialmodelingprep.com"
 SCAN_CACHE_TTL_SEC = 3600
 HIGH_SCORE_EXPAND_THRESHOLD = 65
 MIN_DISPLAY_SCORE = 45
+VOLATILE_UNIVERSE_LIMIT = 120
 
 REQUEST_TIMEOUT = 25
 
@@ -458,6 +457,33 @@ def extract_10k_sections(filing_url: str, sec_api_key: str) -> tuple[str, str, s
         return "", "", f"ExtractorApi error: {e}"
 
 
+def valuation_skew_label(
+    fwd: Optional[float],
+    blended: Optional[float],
+    peer_median: Optional[float],
+    *,
+    rich_ratio: float = 1.22,
+    cheap_ratio: float = 0.78,
+) -> str:
+    """rich = fwd P/E materially *above* peers/sector; cheap = materially below."""
+    if fwd is None or fwd <= 0:
+        return "unknown"
+    ratios: list[float] = []
+    if blended and blended > 0:
+        ratios.append(fwd / blended)
+    if peer_median and peer_median > 0:
+        ratios.append(fwd / peer_median)
+    if not ratios:
+        return "unknown"
+    hi = max(ratios)
+    lo = min(ratios)
+    if hi >= rich_ratio:
+        return "rich"
+    if lo <= cheap_ratio:
+        return "cheap"
+    return "inline"
+
+
 def run_llm_valuation_mismatch(
     ticker: str,
     fwd_pe: Optional[float],
@@ -466,10 +492,13 @@ def run_llm_valuation_mismatch(
     item7: str,
     *,
     xai_key: str,
+    valuation_skew: str = "unknown",
 ) -> tuple[str, str, str]:
     prompt = f"""Stock: {ticker}. Forward P/E (if known): {fwd_pe}. Blended peer/sector benchmark P/E (if known): {peer_avg_pe}.
+Structural valuation vs peers/sector (from data): **{valuation_skew}** — rich means multiples above peers (often stretched / short-bias), cheap means below (often recovery / long-bias).
 
 Does management tone/catalysts contradict the current P/E valuation? Summarize in 100 words + bullish/bearish flag.
+If the stock is **rich** vs peers but the story is rosy, call out why the multiple may still be unjustified. If **cheap**, note turnaround vs value-trap risk.
 
 End with exactly these two lines:
 Flag: Bullish OR Bearish OR Neutral
@@ -528,7 +557,9 @@ class ScanRow:
     insider_buy_shares: float = 0.0
     insider_sell_shares: float = 0.0
     insider_net_buyer: bool = False
+    insider_net_seller: bool = False
     score_insider_bonus: float = 0.0
+    valuation_skew: str = "unknown"
     mismatch_score: float = 0.0
     recommendation: str = "Skip"
     option_suggestion: str = ""
@@ -571,22 +602,68 @@ def recommend_trade(
     llm_flag: str,
     pe_mismatch: bool,
     contradiction_yes: bool,
+    valuation_skew: str,
+    insider_net_seller: bool,
 ) -> str:
+    """
+    Discovery bias: rich forward P/E vs peers/sector → default **Buy Puts** (e.g. multiple ~2× peers + insider selling).
+    Cheap mismatch → **Buy Calls** / **Buy Stock** for recovery-style mispricing.
+    """
     if not vol_ok:
         return "Skip"
-    if score < 40:
+    if not pe_mismatch and score < 48:
         return "Skip"
+
+    rich = valuation_skew == "rich"
+    cheap = valuation_skew == "cheap"
+
+    if pe_mismatch and valuation_skew == "unknown":
+        if insider_net_seller or llm_flag == "Bearish":
+            return "Buy Puts"
+        if llm_flag == "Bullish":
+            return "Buy Calls (CVNA-style)"
+        if score >= 56:
+            return "Buy Stock"
+
+    # Stretched multiple vs industry → puts-first (e.g. ~46x vs ~18–20x peers; insider selling reinforces)
+    if pe_mismatch and rich:
+        return "Buy Puts"
+
+    if pe_mismatch and cheap:
+        if insider_net_seller and (llm_flag == "Bearish" or contradiction_yes):
+            return "Buy Puts"
+        if llm_flag == "Bullish":
+            return "Buy Calls (CVNA-style)"
+        if score >= 55:
+            return "Buy Stock"
+        if score >= 48:
+            return "Buy Stock"
+
+    # Large % deviation but ratio inside inline band — use narrative + score
+    if pe_mismatch and valuation_skew == "inline":
+        if llm_flag == "Bearish" or insider_net_seller:
+            return "Buy Puts"
+        if llm_flag == "Bullish":
+            return "Buy Calls (CVNA-style)"
+        if contradiction_yes:
+            return "Buy Puts"
+        if score >= 58:
+            return "Buy Stock"
+
     if pe_mismatch and contradiction_yes:
         if llm_flag == "Bearish":
             return "Buy Puts"
         if llm_flag == "Bullish":
             return "Buy Calls (CVNA-style)"
-    if score >= 65 and llm_flag == "Bullish" and pe_mismatch:
-        return "Buy Calls (CVNA-style)"
-    if score >= 65 and llm_flag == "Bearish" and pe_mismatch:
-        return "Buy Puts"
-    if score >= 55 and pe_mismatch:
+
+    if score >= 62 and pe_mismatch:
+        if llm_flag == "Bearish":
+            return "Buy Puts"
+        if llm_flag == "Bullish":
+            return "Buy Calls (CVNA-style)"
+    if score >= 52 and pe_mismatch:
         return "Buy Stock"
+
     return "Skip"
 
 
@@ -784,6 +861,8 @@ def _scan_ticker_impl(
     else:
         row.fwd_pe_source = "n/a"
 
+    row.valuation_skew = valuation_skew_label(row.fwd_pe, row.peer_avg_pe, row.peer_median_pe)
+
     peer_for_llm = row.peer_avg_pe
     filing_url = fmp_latest_10k_filing_url(t, fmp_key) if fmp_key else None
 
@@ -802,7 +881,13 @@ def _scan_ticker_impl(
             row.llm_provider = "none"
         else:
             text, flag, prov = run_llm_valuation_mismatch(
-                t, row.fwd_pe, peer_for_llm, item1, item7, xai_key=xai_key
+                t,
+                row.fwd_pe,
+                peer_for_llm,
+                item1,
+                item7,
+                xai_key=xai_key,
+                valuation_skew=row.valuation_skew,
             )
             row.llm_summary = text
             row.llm_flag = flag
@@ -822,8 +907,14 @@ def _scan_ticker_impl(
     row.insider_buy_shares = ins.buy_shares
     row.insider_sell_shares = ins.sell_shares
     row.insider_net_buyer = ins.net_buyer
+    row.insider_net_seller = ins.net_shares < 0
 
-    insider_bonus = 10.0 if ins.net_buyer and row.pe_mismatch_30 else 0.0
+    insider_bonus = 0.0
+    if row.pe_mismatch_30:
+        if row.valuation_skew == "rich" and row.insider_net_seller:
+            insider_bonus = 12.0
+        elif row.valuation_skew == "cheap" and ins.net_buyer:
+            insider_bonus = 10.0
     row.score_insider_bonus = insider_bonus
 
     row.mismatch_score = score_row(
@@ -840,6 +931,8 @@ def _scan_ticker_impl(
         row.llm_flag,
         row.pe_mismatch_30,
         row.narrative_contradiction == "Yes",
+        row.valuation_skew,
+        row.insider_net_seller,
     )
     row.option_suggestion = suggest_options(t, last or yv.last_close)
     row.errors = errors
@@ -908,6 +1001,7 @@ def filtered_to_csv(rows: list[ScanRow]) -> str:
                 "Ticker": r.ticker,
                 "MismatchScore": round(r.mismatch_score, 1),
                 "Recommendation": r.recommendation,
+                "ValuationSkew": r.valuation_skew,
                 "FwdPE": r.fwd_pe,
                 "VolReason": r.vol_reason,
                 "LLMFlag": r.llm_flag,
@@ -942,17 +1036,10 @@ def main() -> None:
     st.markdown('<span class="millenniallity-badge">@millenniallity</span>', unsafe_allow_html=True)
     st.title("Millenniallity Volatility Mismatch Scanner")
     st.markdown(
-        "Auto-discovers **highly volatile** names where **forward P/E disagrees with earnings reality** — "
-        "air-gapped for **Public.com** (stock + options)."
+        "**Pure discovery:** each run pulls a fresh **high-beta, liquid** universe from FMP and scores what to "
+        "**investigate next** — not a watchlist you maintain here. "
+        "**Rich** P/E vs peers → **Buy Puts** bias; **cheap** mismatch → calls / stock. Air-gapped for **Public.com**."
     )
-
-    user_add = st.text_input(
-        "Add specific tickers (optional, comma-separated)",
-        "",
-        help="Merged with the auto high-beta universe from FMP.",
-    )
-    extra = [x.strip().upper() for x in user_add.replace(" ", "").split(",") if x.strip()]
-    extra_map = {x: "Custom" for x in extra}
 
     run = st.button("🚀 Run Auto Scanner — Find Volatile P/E Mismatches", type="primary", use_container_width=True)
 
@@ -974,18 +1061,18 @@ def main() -> None:
     if not xai_key:
         st.warning("**XAI_API_KEY** missing — narrative scoring disabled until set in `.env`.")
 
-    wide = fmp_high_beta_universe(fmp_key, 100)
+    wide = fmp_high_beta_universe(fmp_key, VOLATILE_UNIVERSE_LIMIT)
     if not wide:
-        st.warning("FMP screener returned no symbols — using default watchlist fallback.")
-        wide = list(DEFAULT_TICKERS)
-    universe = sorted(set(wide + extra))
+        st.error("FMP screener returned no symbols — check API key or try again.")
+        st.stop()
+    universe = sorted(set(wide))
 
-    progress = st.progress(0.0, text="Scanning universe…")
+    progress = st.progress(0.0, text="Scanning discovery universe…")
     results: list[ScanRow] = []
 
     for i, tick in enumerate(universe):
         progress.progress((i + 1) / max(1, len(universe)), text=f"{tick}…")
-        sec = sector_for_ticker(tick, extra_map)
+        sec = sector_for_ticker(tick, {})
         try:
             results.append(
                 scan_ticker_cached(
@@ -1002,7 +1089,7 @@ def main() -> None:
             results.append(
                 ScanRow(
                     ticker=tick.upper(),
-                    sector=sector_for_ticker(tick, extra_map),
+                    sector=sector_for_ticker(tick, {}),
                     vol_ok=False,
                     vol_reason="error",
                     beta=None,
@@ -1029,6 +1116,7 @@ def main() -> None:
             "Ticker": r.ticker,
             "Mismatch Score": round(r.mismatch_score, 1),
             "Recommendation": r.recommendation,
+            "Vs Peers": r.valuation_skew,
             "Fwd P/E": r.fwd_pe,
             "Vol Reason": r.vol_reason,
             "LLM Flag": r.llm_flag,
@@ -1049,7 +1137,7 @@ def main() -> None:
 
     st.subheader(f"Detail — score ≥ {MIN_DISPLAY_SCORE} ({'no rows' if not filtered else len(filtered)} names)")
     if not filtered:
-        st.warning(f"No names met score ≥ {MIN_DISPLAY_SCORE}. Re-run later or add tickers.")
+        st.warning(f"No names met score ≥ {MIN_DISPLAY_SCORE}. Re-run later or widen the FMP screener in code.")
 
     for r in filtered:
         title = f"{r.ticker} · {r.mismatch_score:.0f} · {r.recommendation}"
@@ -1068,13 +1156,19 @@ def main() -> None:
                 st.caption(
                     f"Peer median **{r.peer_median_pe}** · Sector bench **{r.sector_benchmark_pe}** · _{r.fwd_pe_source}_"
                 )
+                if r.valuation_skew == "rich":
+                    st.warning("**Vs peers:** **rich** multiple — default trade bias is **long puts** / short-vol on euphoric pricing.")
+                elif r.valuation_skew == "cheap":
+                    st.info("**Vs peers:** **cheap** — explore **calls** or stock if the story holds (watch value traps).")
             with c2:
                 st.markdown("**LLM (10-K vs valuation)**")
                 st.write(r.llm_summary or "—")
-                st.caption(f"Flag: **{r.llm_flag}** · Contradiction: **{r.narrative_contradiction}**")
+                st.caption(
+                    f"Vs peers: **{r.valuation_skew}** · Flag: **{r.llm_flag}** · Contradiction: **{r.narrative_contradiction}**"
+                )
                 st.markdown(f"### Trade: **{r.recommendation}**")
                 if r.score_insider_bonus:
-                    st.success(f"Insider + P/E mismatch bonus: **+{r.score_insider_bonus:.0f}** pts.")
+                    st.success(f"Insider / valuation alignment bonus: **+{r.score_insider_bonus:.0f}** pts.")
                 st.markdown("**Options (1–4 week Public.com)**")
                 st.write(r.option_suggestion)
                 st.markdown("**Unusual Whales**")
