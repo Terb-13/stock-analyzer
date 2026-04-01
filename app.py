@@ -9,6 +9,7 @@ import io
 import os
 import re
 import statistics
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
@@ -402,23 +403,116 @@ def fmp_latest_10k_filing_url(symbol: str, api_key: str) -> Optional[str]:
     return str(link) if link else None
 
 
-def fmp_high_beta_universe(api_key: str, limit: int = 100) -> list[str]:
-    q = (
-        f"{FMP_BASE}/api/v3/stock-screener?"
-        f"marketCapMoreThan=30000000&betaMoreThan=1.35&volumeMoreThan=400000"
-        f"&isEtf=false&limit={limit}&apikey={api_key}"
-    )
-    data, err = _safe_get_json(q)
-    if err or not isinstance(data, list):
+def _fmp_response_to_symbols(data: Any) -> list[str]:
+    """Normalize FMP screener / movers JSON into uppercase tickers."""
+    if data is None:
+        return []
+    if isinstance(data, dict):
+        if data.get("Error Message") or data.get("error"):
+            return []
+        data = data.get("data") or data.get("results") or data.get("stockList") or []
+    if not isinstance(data, list):
         return []
     out: list[str] = []
     for row in data:
+        if isinstance(row, str):
+            if row.strip():
+                out.append(row.strip().upper())
+            continue
         if not isinstance(row, dict):
             continue
-        s = row.get("symbol")
-        if s:
-            out.append(str(s).upper())
-    return out[:limit]
+        s = row.get("symbol") or row.get("ticker") or row.get("Symbol") or row.get("tickerSymbol")
+        if s and str(s).strip():
+            out.append(str(s).strip().upper())
+    return out
+
+
+def fmp_high_beta_universe(api_key: str, limit: int = 100) -> tuple[list[str], str]:
+    """
+    Build a volatile discovery list: try **stable company-screener**, then legacy **v3 stock-screener**,
+    then **most actives / gainers** (usually allowed on free tier if screener is paywalled or params reject).
+
+    Returns `(symbols, source_label)` so the UI can explain which path succeeded.
+    """
+    if not api_key:
+        return [], "none"
+
+    attempts: list[tuple[str, dict[str, str]]] = [
+        (
+            f"{FMP_BASE}/stable/company-screener",
+            {
+                "apikey": api_key,
+                "limit": str(limit),
+                "isActivelyTrading": "true",
+                "isEtf": "false",
+                "betaMoreThan": "1.25",
+                "volumeMoreThan": "100000",
+                "marketCapMoreThan": "10000000",
+            },
+        ),
+        (
+            f"{FMP_BASE}/stable/company-screener",
+            {
+                "apikey": api_key,
+                "limit": str(limit),
+                "isActivelyTrading": "true",
+                "betaMoreThan": "1.15",
+                "marketCapMoreThan": "5000000",
+            },
+        ),
+        (
+            f"{FMP_BASE}/stable/company-screener",
+            {
+                "apikey": api_key,
+                "limit": str(limit),
+                "isActivelyTrading": "true",
+                "marketCapMoreThan": "30000000",
+                "betaMoreThan": "1.1",
+            },
+        ),
+        (
+            f"{FMP_BASE}/api/v3/stock-screener",
+            {
+                "apikey": api_key,
+                "limit": str(limit),
+                "isActivelyTrading": "true",
+                "isEtf": "false",
+                "betaMoreThan": "1.25",
+                "volumeMoreThan": "100000",
+                "marketCapMoreThan": "10000000",
+            },
+        ),
+        (
+            f"{FMP_BASE}/api/v3/stock-screener",
+            {
+                "apikey": api_key,
+                "limit": str(limit),
+                "marketCapMoreThan": "1000000",
+                "betaMoreThan": "1.05",
+            },
+        ),
+    ]
+
+    for base, params in attempts:
+        url = f"{base}?{urllib.parse.urlencode(params)}"
+        data, err = _safe_get_json(url)
+        if err:
+            continue
+        syms = _fmp_response_to_symbols(data)
+        if syms:
+            label = "stable/company-screener" if "stable" in base else "v3/stock-screener"
+            return syms[:limit], label
+
+    for tail in ("stock_market/actives", "stock_market/gainers", "stock_market/losers"):
+        url = f"{FMP_BASE}/api/v3/{tail}?apikey={api_key}"
+        data, err = _safe_get_json(url)
+        if err:
+            continue
+        syms = _fmp_response_to_symbols(data)
+        if syms:
+            return syms[:limit], f"v3/{tail}"
+
+    return [], "none"
 
 
 # -----------------------------------------------------------------------------
@@ -1061,10 +1155,20 @@ def main() -> None:
     if not xai_key:
         st.warning("**XAI_API_KEY** missing — narrative scoring disabled until set in `.env`.")
 
-    wide = fmp_high_beta_universe(fmp_key, VOLATILE_UNIVERSE_LIMIT)
+    wide, universe_source = fmp_high_beta_universe(fmp_key, VOLATILE_UNIVERSE_LIMIT)
     if not wide:
-        st.error("FMP screener returned no symbols — check API key or try again.")
+        st.error(
+            "**No symbols from FMP.** Confirm `FMP_API_KEY` in `.env`, that the key is active at "
+            "[financialmodelingprep.com](https://site.financialmodelingprep.com/developer/docs/pricing), "
+            "and try again. (Screener + actives/gainers endpoints were tried.)"
+        )
         st.stop()
+    if "stock_market" in universe_source:
+        st.info(
+            f"**Universe source:** `{universe_source}` — company **screener** returned no rows for your key/filters; "
+            "using **high-liquidity movers** instead (still fine for discovery). "
+            "For strict high-beta lists, check your FMP plan or API playground."
+        )
     universe = sorted(set(wide))
 
     progress = st.progress(0.0, text="Scanning discovery universe…")
