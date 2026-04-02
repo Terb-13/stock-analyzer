@@ -33,6 +33,14 @@ try:
 except ImportError:
     ExtractorApi = None  # type: ignore
 
+from auth_access import (
+    auth_required,
+    ensure_bootstrap_admin_from_env,
+    logout_control,
+    render_admin_panel,
+    render_auth_gate,
+    supabase_configured,
+)
 # -----------------------------------------------------------------------------
 # Branding & config
 # -----------------------------------------------------------------------------
@@ -72,6 +80,35 @@ SECTOR_PE_BENCHMARK: dict[str, float] = {
     "Custom": 20.0,
 }
 
+# yfinance "industry" text (lowercased) substring → comparison tickers when FMP & Yahoo fail
+INDUSTRY_PEER_FALLBACK: list[tuple[str, tuple[str, ...]]] = [
+    ("semiconductor", ("AMD", "INTC", "AVGO", "QCOM", "MU", "AMAT", "LRCX", "ON")),
+    ("consumer electronics", ("AAPL", "SONY", "DELL", "HPQ")),
+    ("software", ("MSFT", "ORCL", "ADBE", "NOW", "CRM", "INTU", "PANW")),
+    ("internet content", ("GOOGL", "META", "SNAP", "PINS", "RDDT")),
+    ("internet", ("GOOGL", "META", "SNAP", "EQIX")),
+    ("oil", ("XOM", "CVX", "COP", "SLB", "EOG", "MPC")),
+    ("bank", ("JPM", "BAC", "WFC", "C", "GS", "MS")),
+    ("insurance", ("PGR", "ALL", "TRV", "MET")),
+    ("reit", ("AMT", "PLD", "EQIX", "SPG", "O", "DLR")),
+    ("drug", ("JNJ", "PFE", "LLY", "MRK", "ABBV", "BMY")),
+    ("biotechnology", ("AMGN", "GILD", "VRTX", "REGN", "BIIB")),
+    ("medical", ("ABT", "TMO", "DHR", "SYK", "MDT")),
+    ("retail", ("WMT", "TGT", "COST", "DG", "DLTR")),
+    ("specialty retail", ("HD", "LOW", "NKE", "TJX")),
+    ("airlines", ("DAL", "UAL", "AAL", "LUV")),
+    ("aerospace", ("BA", "LMT", "RTX", "NOC", "GD")),
+    ("auto", ("F", "GM", "STLA", "RIVN")),
+    ("utilities", ("NEE", "DUK", "SO", "AEP", "XEL")),
+    ("entertainment", ("DIS", "NFLX", "WBD", "SONY")),
+    ("restaurants", ("MCD", "SBUX", "YUM", "DPZ")),
+    ("beverages", ("KO", "PEP", "MNST", "KDP")),
+    ("marine shipping", ("ZIM", "DAC", "GSL", "MATX")),
+    ("capital markets", ("GS", "MS", "SCHW", "BLK")),
+    ("credit services", ("V", "MA", "AXP")),
+    ("household", ("PG", "CL", "KMB", "EL")),
+]
+
 FMP_BASE = "https://financialmodelingprep.com"
 SCAN_CACHE_TTL_SEC = 3600
 HIGH_SCORE_EXPAND_THRESHOLD = 65
@@ -79,6 +116,84 @@ MIN_DISPLAY_SCORE = 45
 VOLATILE_UNIVERSE_LIMIT = 120
 
 REQUEST_TIMEOUT = 25
+
+# Loaded once per process from sec.gov (ticker → zero-padded 10-digit CIK)
+_SEC_TICKER_CIK_MAP: Optional[dict[str, str]] = None
+
+
+def _sec_user_agent() -> str:
+    return os.getenv("SEC_EDGAR_USER_AGENT", "MillenniallityScanner contact@example.com")
+
+
+def _sec_ticker_to_cik_map() -> dict[str, str]:
+    """SEC company_tickers.json — public, no key."""
+    global _SEC_TICKER_CIK_MAP
+    if _SEC_TICKER_CIK_MAP is not None:
+        return _SEC_TICKER_CIK_MAP
+    try:
+        r = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers={"User-Agent": _sec_user_agent()},
+            timeout=45,
+        )
+        r.raise_for_status()
+        raw = r.json()
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for v in raw.values():
+            if not isinstance(v, dict):
+                continue
+            tick = v.get("ticker")
+            cik = v.get("cik_str")
+            if tick is None or cik is None:
+                continue
+            cik_int = int(cik) if not isinstance(cik, int) else cik
+            out[str(tick).upper()] = str(cik_int).zfill(10)
+    _SEC_TICKER_CIK_MAP = out
+    return out
+
+
+def sec_submissions_latest_10k_primary_url(ticker: str) -> Optional[str]:
+    """Latest Form 10-K primary document via data.sec.gov submissions JSON (no FMP)."""
+    sym = ticker.upper().strip()
+    if not sym:
+        return None
+    cik10 = _sec_ticker_to_cik_map().get(sym)
+    if not cik10:
+        return None
+    url = f"https://data.sec.gov/submissions/CIK{cik10}.json"
+    try:
+        r = requests.get(url, headers={"User-Agent": _sec_user_agent()}, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return None
+    recent = data.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    dates = recent.get("filingDate", [])
+    accs = recent.get("accessionNumber", [])
+    docs = recent.get("primaryDocument", [])
+    if not forms:
+        return None
+    n = min(len(forms), len(dates), len(accs), len(docs))
+    best_i = -1
+    best_date = ""
+    for i in range(n):
+        if forms[i] != "10-K":
+            continue
+        fd = str(dates[i]) if i < len(dates) else ""
+        if fd >= best_date:
+            best_date = fd
+            best_i = i
+    if best_i < 0:
+        return None
+    acc = accs[best_i]
+    doc = docs[best_i]
+    acc_nodash = acc.replace("-", "")
+    cik_numeric = str(int(cik10))
+    return f"https://www.sec.gov/Archives/edgar/data/{cik_numeric}/{acc_nodash}/{doc}"
 
 
 def _env_keys() -> dict[str, str]:
@@ -112,11 +227,28 @@ XAI_CHAT_URL = "https://api.x.ai/v1/chat/completions"
 LLM_TIMEOUT = 120
 
 
+def _xai_error_detail(response: requests.Response) -> str:
+    try:
+        j = response.json()
+    except Exception:
+        return (response.text or "")[:600]
+    err = j.get("error")
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("code") or err)[:600]
+    if err:
+        return str(err)[:600]
+    return str(j)[:600]
+
+
 def xai_chat_completion(api_key: str, user_content: str) -> str:
-    model = os.getenv("XAI_MODEL", "grok-2-latest")
+    # Override with `XAI_MODEL` in `.env` if your key uses a different id (console.x.ai).
+    model = os.getenv("XAI_MODEL", "grok-4.20-0309-reasoning").strip() or "grok-4.20-0309-reasoning"
+    text_in = (user_content or "")[:28000]
+    if not text_in.strip():
+        raise ValueError("xAI: empty prompt (no 10-K text to analyze)")
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": user_content[:28000]}],
+        "messages": [{"role": "user", "content": text_in}],
         "temperature": 0.2,
         "max_tokens": 512,
     }
@@ -126,13 +258,168 @@ def xai_chat_completion(api_key: str, user_content: str) -> str:
         json=payload,
         timeout=LLM_TIMEOUT,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        detail = _xai_error_detail(r)
+        raise RuntimeError(f"{r.status_code} {XAI_CHAT_URL} — {detail}")
     data = r.json()
     choices = data.get("choices") or []
     if not choices:
         raise ValueError("xAI response missing choices")
     msg = choices[0].get("message") or {}
     return (msg.get("content") or "").strip()
+
+
+def xai_chat_messages(
+    api_key: str,
+    messages: list[dict[str, str]],
+    *,
+    max_tokens: int = 2048,
+    temperature: float = 0.35,
+) -> str:
+    """OpenAI-style multi-turn chat for follow-ups (roles: system, user, assistant)."""
+    model = os.getenv("XAI_MODEL", "grok-4.20-0309-reasoning").strip() or "grok-4.20-0309-reasoning"
+    safe: list[dict[str, str]] = []
+    total = 0
+    for m in messages:
+        role = (m.get("role") or "user").strip()
+        content = (m.get("content") or "").strip()
+        if role not in ("system", "user", "assistant") or not content:
+            continue
+        chunk = content[:24000]
+        total += len(chunk)
+        safe.append({"role": role, "content": chunk})
+    if not safe:
+        raise ValueError("xAI: no valid messages")
+    while total > 100000 and len(safe) > 2:
+        removed = safe.pop(1)
+        total -= len(removed.get("content", ""))
+    payload = {
+        "model": model,
+        "messages": safe,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    r = requests.post(
+        XAI_CHAT_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=LLM_TIMEOUT,
+    )
+    if r.status_code >= 400:
+        detail = _xai_error_detail(r)
+        raise RuntimeError(f"{r.status_code} {XAI_CHAT_URL} — {detail}")
+    data = r.json()
+    choices = data.get("choices") or []
+    if not choices:
+        raise ValueError("xAI response missing choices")
+    msg = choices[0].get("message") or {}
+    return (msg.get("content") or "").strip()
+
+
+def _grok_scan_context_system_message(row: ScanRow) -> str:
+    summ = (row.llm_summary or "").strip()
+    if len(summ) > 6000:
+        summ = summ[:6000] + "…"
+    return (
+        f"You are **Grok** on the Millenniallity Volatility Scanner. The user is discussing **{row.ticker}** from a "
+        f"**saved scan snapshot** (not live prices). Be direct, nuanced, and educational — not personalized "
+        f"investment advice.\n\n"
+        f"**Snapshot:**\n"
+        f"- Trade bias: {row.recommendation}\n"
+        f"- Valuation vs peers: {row.valuation_skew} | Fwd P/E {row.fwd_pe} vs bench ~{row.peer_avg_pe}\n"
+        f"- Vol filter: {row.vol_reason}\n"
+        f"- LLM (10-K vs valuation): {summ or '—'}\n"
+        f"- Insider (Unusual Whales note): {(row.unusual_whales_note or '—')[:800]}\n"
+        f"- Options blurb: {row.option_suggestion or '—'}\n"
+        f"If they ask for data you do not have from this snapshot, say so and reason qualitatively."
+    )
+
+
+def render_grok_followup_chat(ticker: str, row: ScanRow, xai_key: str) -> None:
+    """Per-ticker Grok chat (form-based; multiple tickers per page)."""
+    safe_t = re.sub(r"[^a-zA-Z0-9_]", "_", ticker.upper())
+    sess_hist = f"grok_chat_hist_{safe_t}"
+    if sess_hist not in st.session_state:
+        st.session_state[sess_hist] = []
+    hist_len = len(st.session_state[sess_hist])
+
+    if not xai_key:
+        with st.expander("Grok — deeper dive & chat", expanded=False):
+            st.caption("_Add **XAI_API_KEY** to `.env` to chat with Grok here._")
+        return
+
+    with st.expander("Grok — deeper dive & chat", expanded=bool(hist_len)):
+        st.caption(
+            "Chat with **Grok** using this scan as context. Replies are **not** financial advice; verify anything material."
+        )
+        q1, q2, q3 = st.columns(3)
+        with q1:
+            if st.button("Expand analysis", key=f"grok_ex_{safe_t}", help="Deepen the thesis"):
+                st.session_state[sess_hist].append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Expand on this scan: bull vs bear, key risks, and what would invalidate the "
+                            f"{row.recommendation} bias. ~3 short paragraphs."
+                        ),
+                    }
+                )
+                try:
+                    with st.spinner("Grok…"):
+                        messages = [{"role": "system", "content": _grok_scan_context_system_message(row)}]
+                        messages.extend(st.session_state[sess_hist])
+                        reply = xai_chat_messages(xai_key, messages, max_tokens=2048, temperature=0.35)
+                    st.session_state[sess_hist].append({"role": "assistant", "content": reply})
+                except Exception as e:
+                    st.session_state[sess_hist].pop()
+                    st.error(str(e))
+                st.rerun()
+        with q2:
+            if st.button("Key risks", key=f"grok_risk_{safe_t}"):
+                st.session_state[sess_hist].append(
+                    {"role": "user", "content": f"What are the top 5 risks for {row.ticker} here, given this scan?"}
+                )
+                try:
+                    with st.spinner("Grok…"):
+                        messages = [{"role": "system", "content": _grok_scan_context_system_message(row)}]
+                        messages.extend(st.session_state[sess_hist])
+                        reply = xai_chat_messages(xai_key, messages, max_tokens=1536, temperature=0.35)
+                    st.session_state[sess_hist].append({"role": "assistant", "content": reply})
+                except Exception as e:
+                    st.session_state[sess_hist].pop()
+                    st.error(str(e))
+                st.rerun()
+        with q3:
+            if st.button("Clear chat", key=f"grok_clr_{safe_t}"):
+                st.session_state[sess_hist] = []
+                st.rerun()
+
+        for msg in st.session_state[sess_hist]:
+            role = msg.get("role", "user")
+            with st.chat_message(role):
+                st.markdown(msg.get("content", ""))
+
+        with st.form(f"grok_chat_form_{safe_t}", clear_on_submit=True):
+            prompt = st.text_area(
+                "Message Grok",
+                height=88,
+                placeholder="Ask anything about this name given the scan context…",
+                key=f"grok_ta_{safe_t}",
+                label_visibility="collapsed",
+            )
+            sent = st.form_submit_button("Send")
+        if sent and prompt and prompt.strip():
+            st.session_state[sess_hist].append({"role": "user", "content": prompt.strip()})
+            try:
+                with st.spinner("Grok…"):
+                    messages = [{"role": "system", "content": _grok_scan_context_system_message(row)}]
+                    messages.extend(st.session_state[sess_hist])
+                    reply = xai_chat_messages(xai_key, messages, max_tokens=2048, temperature=0.35)
+                st.session_state[sess_hist].append({"role": "assistant", "content": reply})
+            except Exception as e:
+                st.session_state[sess_hist].pop()
+                st.error(str(e))
+            st.rerun()
 
 
 # -----------------------------------------------------------------------------
@@ -244,6 +531,27 @@ def fmp_analyst_forward_eps(sym: str, api_key: str) -> Optional[float]:
     return None
 
 
+def _fmp_first_fundamental_row(data: Any) -> dict:
+    """Normalize stable / v3 list-or-{data:[]} FMP payloads into one ratio row."""
+    if not data:
+        return {}
+    if isinstance(data, dict):
+        if data.get("Error Message") or data.get("error"):
+            return {}
+        inner = data.get("data")
+        if isinstance(inner, list) and inner and isinstance(inner[0], dict):
+            return inner[0]
+        if any(
+            data.get(k) is not None
+            for k in ("forwardPE", "peRatioTTM", "peRatio", "priceToEarningsRatioTTM", "grossProfitMarginTTM")
+        ):
+            return data
+        return {}
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0]
+    return {}
+
+
 def resolve_forward_pe(
     sym: str,
     api_key: str,
@@ -251,31 +559,51 @@ def resolve_forward_pe(
     *,
     allow_analyst_implied: bool = True,
 ) -> tuple[Optional[float], str]:
-    url = f"{FMP_BASE}/api/v3/ratios-ttm/{sym}?apikey={api_key}"
-    data, _ = _safe_get_json(url)
-    row: dict = data[0] if data and isinstance(data, list) and isinstance(data[0], dict) else {}
+    ratios_row: dict = {}
+    if api_key:
+        for path in (
+            f"{FMP_BASE}/stable/ratios-ttm?symbol={sym}&apikey={api_key}",
+            f"{FMP_BASE}/api/v3/ratios-ttm/{sym}?apikey={api_key}",
+        ):
+            raw, _ = _safe_get_json(path)
+            row = _fmp_first_fundamental_row(raw)
+            if row:
+                ratios_row = row
+            v = row.get("forwardPE")
+            if v is not None and isinstance(v, (int, float)) and v > 0:
+                tag = "FMP stable ratios-ttm forwardPE" if "stable" in path else "FMP ratios-ttm forwardPE"
+                return float(v), tag
 
-    v = row.get("forwardPE")
-    if v is not None and isinstance(v, (int, float)) and v > 0:
-        return float(v), "FMP ratios-ttm forwardPE"
+        km_url = f"{FMP_BASE}/stable/key-metrics-ttm?symbol={sym}&apikey={api_key}"
+        km, _ = _safe_get_json(km_url)
+        km_row = _fmp_first_fundamental_row(km)
+        if not km_row:
+            km_url = f"{FMP_BASE}/api/v3/key-metrics-ttm/{sym}?apikey={api_key}"
+            km, _ = _safe_get_json(km_url)
+            km_row = _fmp_first_fundamental_row(km)
+        for k in ("forwardPE", "peRatio", "priceEarningsRatio"):
+            val = km_row.get(k)
+            if val is not None and isinstance(val, (int, float)) and val > 0:
+                return float(val), f"FMP key-metrics-ttm {k}"
 
-    km_url = f"{FMP_BASE}/api/v3/key-metrics-ttm/{sym}?apikey={api_key}"
-    km, _ = _safe_get_json(km_url)
-    km_row: dict = km[0] if km and isinstance(km, list) and isinstance(km[0], dict) else {}
-    for k in ("forwardPE", "peRatio", "priceEarningsRatio"):
-        val = km_row.get(k)
-        if val is not None and isinstance(val, (int, float)) and val > 0:
-            return float(val), f"FMP key-metrics-ttm {k}"
+        for k in ("priceToEarningsRatioTTM", "peRatioTTM", "peRatio", "priceToEarningsRatio"):
+            val = ratios_row.get(k)
+            if val is not None and isinstance(val, (int, float)) and val > 0:
+                return float(val), f"FMP ratios-ttm {k} (TTM / trailing)"
 
-    for k in ("priceToEarningsRatioTTM", "peRatioTTM", "peRatio", "priceToEarningsRatio"):
-        val = row.get(k)
-        if val is not None and isinstance(val, (int, float)) and val > 0:
-            return float(val), f"FMP ratios-ttm {k} (TTM / trailing)"
+        if allow_analyst_implied and price is not None and price > 0:
+            eps = fmp_analyst_forward_eps(sym, api_key)
+            if eps and eps > 0:
+                return float(price / eps), "FMP analyst-estimates implied (price ÷ next EPS)"
 
-    if allow_analyst_implied and price is not None and price > 0:
-        eps = fmp_analyst_forward_eps(sym, api_key)
-        if eps and eps > 0:
-            return float(price / eps), "FMP analyst-estimates implied (price ÷ next EPS)"
+    try:
+        yinfo = yf.Ticker(sym).info or {}
+        for k in ("forwardPE", "trailingPE"):
+            val = yinfo.get(k)
+            if val is not None and isinstance(val, (int, float)) and val > 0:
+                return float(val), f"yfinance {k}"
+    except Exception:
+        pass
 
     return None, "n/a"
 
@@ -335,7 +663,7 @@ def fmp_forward_pe_and_peer_avg(
         if p == symbol:
             continue
         px = _yf_last_price(p)
-        ppe, _ = resolve_forward_pe(p, api_key, px, allow_analyst_implied=False)
+        ppe, _ = resolve_forward_pe(p, api_key, px, allow_analyst_implied=True)
         pe_map[p] = ppe
         if ppe is not None and ppe > 0:
             peer_vals.append(float(ppe))
@@ -349,9 +677,24 @@ def fmp_forward_pe_and_peer_avg(
 
 
 def fmp_stock_peers(symbol: str, api_key: str) -> list[str]:
-    url = f"{FMP_BASE}/stable/stock-peers?symbol={symbol}&apikey={api_key}"
-    data, err = _safe_get_json(url)
-    if err or data is None:
+    if not api_key:
+        return []
+    urls = [
+        f"{FMP_BASE}/stable/stock-peers?symbol={symbol}&apikey={api_key}",
+        f"{FMP_BASE}/api/v4/stock_peers?symbol={symbol}&apikey={api_key}",
+        f"{FMP_BASE}/api/v3/stock_peers?symbol={symbol}&apikey={api_key}",
+    ]
+    data: Any = None
+    err: Optional[str] = None
+    for url in urls:
+        data, err = _safe_get_json(url)
+        if err or data is None:
+            continue
+        if isinstance(data, dict) and (data.get("Error Message") or data.get("error")):
+            data = None
+            continue
+        break
+    if data is None:
         return []
     if isinstance(data, list) and data and isinstance(data[0], str):
         return [s.upper() for s in data if s][:15]
@@ -365,6 +708,77 @@ def fmp_stock_peers(symbol: str, api_key: str) -> list[str]:
         if isinstance(peers, list):
             return [str(p).upper() for p in peers if p][:15]
     return []
+
+
+def _yf_industry_sector_blob(symbol: str) -> str:
+    try:
+        inf = yf.Ticker(symbol).info or {}
+        ind = str(inf.get("industry") or "")
+        sec = str(inf.get("sector") or "")
+        return re.sub(r"[^a-z0-9]+", " ", f"{ind} {sec}".lower()).strip()
+    except Exception:
+        return ""
+
+
+def yfinance_industry_peer_fallback(symbol: str, limit: int = 10) -> list[str]:
+    sym = symbol.upper().strip()
+    blob = _yf_industry_sector_blob(symbol)
+    if not blob:
+        return []
+    for key, tickers in INDUSTRY_PEER_FALLBACK:
+        if key in blob:
+            return [t for t in tickers if t.upper() != sym][:limit]
+    return []
+
+
+def yahoo_recommended_peer_symbols(symbol: str, limit: int = 10) -> list[str]:
+    """
+    Yahoo `recommendedSymbols` when FMP stock-peers is unavailable (rate limit / plan).
+    Not a formal comp sheet — good enough for P/E context bars.
+    """
+    sym = symbol.upper().strip()
+    if not sym:
+        return []
+    url = f"https://query1.finance.yahoo.com/v6/finance/recommendationsbysymbol/{sym}"
+    headers = {"User-Agent": YAHOO_SCREENER_UA}
+    try:
+        r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        j = r.json()
+    except Exception:
+        return []
+    fin = (j.get("finance") or {}).get("result") or []
+    if not fin:
+        return []
+    rec = fin[0].get("recommendedSymbols") or []
+    out: list[str] = []
+    for item in rec:
+        if not isinstance(item, dict):
+            continue
+        s = item.get("symbol")
+        if not s:
+            continue
+        u = str(s).upper().strip()
+        if u != sym:
+            out.append(u)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def discover_stock_peers(symbol: str, fmp_key: str) -> tuple[list[str], str]:
+    fmp_list = fmp_stock_peers(symbol, fmp_key) if fmp_key else []
+    fmp_list = [p for p in fmp_list if p.upper() != symbol.upper()]
+    if fmp_list:
+        return fmp_list[:12], "FMP"
+    y = yahoo_recommended_peer_symbols(symbol, 12)
+    y = [p for p in y if p.upper() != symbol.upper()][:10]
+    if y:
+        return y, "Yahoo"
+    basket = yfinance_industry_peer_fallback(symbol, 10)
+    if basket:
+        return basket, "yfinance-industry"
+    return [], "none"
 
 
 def fmp_try_iv_metric(symbol: str, api_key: str) -> tuple[Optional[float], str]:
@@ -390,17 +804,65 @@ def fmp_try_iv_metric(symbol: str, api_key: str) -> tuple[Optional[float], str]:
     return None, ""
 
 
-def fmp_latest_10k_filing_url(symbol: str, api_key: str) -> Optional[str]:
-    url = f"{FMP_BASE}/api/v3/sec_filings/{symbol}?type=10-K&page=0&apikey={api_key}"
-    data, _ = _safe_get_json(url)
-    if not data or not isinstance(data, list):
-        url2 = f"{FMP_BASE}/api/v3/sec-filings/{symbol}?type=10-k&apikey={api_key}"
-        data, _ = _safe_get_json(url2)
-    if not data or not isinstance(data, list):
+def sec_edgar_latest_10k_index_url(ticker: str) -> Optional[str]:
+    """Latest 10-K filing index page from SEC EDGAR Atom (no API key; set SEC_EDGAR_USER_AGENT in `.env`)."""
+    sym = ticker.upper().strip()
+    if not sym:
         return None
-    row = data[0]
-    link = row.get("finalLink") or row.get("link") or row.get("linkToFilingDetails")
-    return str(link) if link else None
+    q = urllib.parse.urlencode(
+        {"action": "getcompany", "ticker": sym, "type": "10-K", "owner": "exclude", "count": "1", "output": "atom"}
+    )
+    url = f"https://www.sec.gov/cgi-bin/browse-edgar?{q}"
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": _sec_user_agent(), "Accept": "application/atom+xml"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        r.raise_for_status()
+        text = r.text
+    except Exception:
+        return None
+    m = re.search(
+        r"<filing-href>(https://www\.sec\.gov/Archives/edgar/data/[^<]+\.htm)</filing-href>",
+        text,
+    )
+    return m.group(1) if m else None
+
+
+def resolve_latest_10k_filing_url(symbol: str, api_key: str) -> tuple[Optional[str], str]:
+    """Prefer SEC.gov (free, reliable); FMP last so a dead quota does not block the scan."""
+    sym = symbol.upper().strip()
+    prim = sec_submissions_latest_10k_primary_url(sym)
+    if prim:
+        return prim, "SEC submissions"
+    sec = sec_edgar_latest_10k_index_url(sym)
+    if sec:
+        return sec, "SEC atom"
+    if api_key:
+        for tpl in (
+            f"{FMP_BASE}/api/v3/sec_filings/{sym}?type=10-K&page=0&apikey={api_key}",
+            f"{FMP_BASE}/api/v3/sec-filings/{sym}?type=10-k&apikey={api_key}",
+        ):
+            data, err = _safe_get_json(tpl)
+            if err or not data:
+                continue
+            if isinstance(data, dict) and (data.get("Error Message") or data.get("error")):
+                continue
+            if not isinstance(data, list) or not data:
+                continue
+            row = data[0]
+            if not isinstance(row, dict):
+                continue
+            link = row.get("finalLink") or row.get("link") or row.get("linkToFilingDetails")
+            if link:
+                return str(link), "FMP"
+    return None, "none"
+
+
+def fmp_latest_10k_filing_url(symbol: str, api_key: str) -> Optional[str]:
+    u, _ = resolve_latest_10k_filing_url(symbol, api_key)
+    return u
 
 
 def _fmp_response_to_symbols(data: Any) -> list[str]:
@@ -512,6 +974,66 @@ def fmp_high_beta_universe(api_key: str, limit: int = 100) -> tuple[list[str], s
         if syms:
             return syms[:limit], f"v3/{tail}"
 
+    return [], "none"
+
+
+YAHOO_PREDEFINED_SCREENER_IDS = ("most_actives", "day_gainers", "day_losers")
+YAHOO_SCREENER_UA = "Mozilla/5.0 (compatible; MillenniallityScanner/1.0; +https://github.com)"
+
+
+def _safe_get_json_with_headers(url: str, headers: dict[str, str]) -> tuple[Any, Optional[str]]:
+    try:
+        r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        return r.json(), None
+    except Exception as e:
+        return None, str(e)
+
+
+def yahoo_screener_universe(limit: int) -> tuple[list[str], str]:
+    """Liquid movers from Yahoo predefined screeners (no API key). Used when FMP list endpoints fail."""
+    if limit <= 0:
+        return [], "yahoo/none"
+    headers = {"User-Agent": YAHOO_SCREENER_UA}
+    per_call = max(25, min(limit, 100))
+    seen: list[str] = []
+    used: list[str] = []
+    for scr_id in YAHOO_PREDEFINED_SCREENER_IDS:
+        url = (
+            "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+            f"?count={per_call}&scrIds={scr_id}&formatted=false"
+        )
+        data, err = _safe_get_json_with_headers(url, headers)
+        if err or not data:
+            continue
+        fin = data.get("finance") if isinstance(data, dict) else None
+        result = (fin or {}).get("result") or []
+        if not result:
+            continue
+        quotes = result[0].get("quotes") or []
+        if quotes:
+            used.append(scr_id)
+        for q in quotes:
+            if not isinstance(q, dict):
+                continue
+            sym = q.get("symbol")
+            if sym and str(sym).strip():
+                u = str(sym).strip().upper()
+                if u not in seen:
+                    seen.append(u)
+            if len(seen) >= limit:
+                return seen[:limit], "yahoo/" + "+".join(used) if used else "yahoo/empty"
+    return seen[:limit], "yahoo/" + "+".join(used) if used else "yahoo/none"
+
+
+def build_discovery_universe(fmp_api_key: str, limit: int) -> tuple[list[str], str]:
+    """FMP volatile universe first; if empty (402/403 paywalls), Yahoo predefined screeners."""
+    syms, src = fmp_high_beta_universe(fmp_api_key, limit)
+    if syms:
+        return syms, src
+    y_syms, y_src = yahoo_screener_universe(limit)
+    if y_syms:
+        return y_syms, y_src
     return [], "none"
 
 
@@ -638,6 +1160,7 @@ class ScanRow:
     pe_deviation_pct: Optional[float]
     pe_mismatch_30: bool
     peers_for_chart: list[str] = field(default_factory=list)
+    peer_source: str = ""
     pe_by_ticker: dict = field(default_factory=dict)
     llm_summary: str = ""
     llm_flag: str = "Unknown"
@@ -881,6 +1404,100 @@ def fetch_unusual_insider_4q(ticker: str, uw_key: str) -> InsiderFlowSummary:
     return InsiderFlowSummary(net, buy, sell, n, line, nb)
 
 
+def _parse_uw_iso_time(s: Any) -> Optional[datetime]:
+    if s is None:
+        return None
+    if not isinstance(s, str):
+        return None
+    t = s.strip()
+    if not t:
+        return None
+    t = t.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(t)
+    except ValueError:
+        try:
+            return datetime.strptime(t[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            try:
+                return datetime.strptime(t[:10], "%Y-%m-%d")
+            except ValueError:
+                return None
+
+
+def _uw_rows_to_daily_series(rows: list[dict]) -> tuple[list[datetime], list[float]]:
+    """
+    Unusual Whales 1d+1Y often returns multiple rows per calendar `date` (pre / post / regular).
+    For each day, keep the bar with best session priority (regular `r` wins).
+    """
+    pri_map = {"r": 3, "po": 2, "pr": 2}
+    by_day: dict[str, tuple[datetime, float, int]] = {}
+
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        ds = item.get("date")
+        if isinstance(ds, str) and len(ds) >= 10:
+            day = ds[:10]
+            try:
+                dt = datetime.strptime(day, "%Y-%m-%d")
+            except ValueError:
+                continue
+        else:
+            pt = _parse_uw_iso_time(item.get("end_time") or item.get("start_time") or ds)
+            if pt is None:
+                continue
+            day = pt.strftime("%Y-%m-%d")
+            dt = datetime.strptime(day, "%Y-%m-%d")
+        c = item.get("close")
+        try:
+            cf = float(c) if c is not None else None
+        except (TypeError, ValueError):
+            cf = None
+        if cf is None or cf <= 0:
+            continue
+        mt = str(item.get("market_time") or "").lower()
+        pri = pri_map.get(mt, 1)
+        prev = by_day.get(day)
+        if prev is None or pri > prev[2] or (pri == prev[2] and dt >= prev[0]):
+            by_day[day] = (dt, cf, pri)
+
+    if len(by_day) < 2:
+        return [], []
+
+    ordered = sorted(by_day.items(), key=lambda x: x[0])
+    return [p[1][0] for p in ordered], [p[1][1] for p in ordered]
+
+
+def fetch_uw_stock_ohlc_1y(ticker: str, uw_key: str) -> tuple[list[datetime], list[float], str]:
+    """Daily OHLC from Unusual Whales (~12 months via timeframe=1Y)."""
+    if not uw_key:
+        return [], [], "no Unusual Whales API key"
+    sym = ticker.upper().strip()
+    url = f"https://api.unusualwhales.com/api/stock/{sym}/ohlc/1d"
+    params = {"timeframe": "1Y"}
+    headers = {"Authorization": f"Bearer {uw_key}", "Accept": "application/json"}
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 401:
+            return [], [], "Unusual Whales: 401 unauthorized"
+        if r.status_code == 402:
+            return [], [], "Unusual Whales: OHLC requires a paid tier (402)"
+        r.raise_for_status()
+        body = r.json()
+    except Exception as e:
+        return [], [], f"Unusual Whales OHLC error: {e}"
+
+    rows_raw = body.get("data") if isinstance(body, dict) else body
+    if not isinstance(rows_raw, list) or not rows_raw:
+        return [], [], "Unusual Whales: no OHLC rows"
+    rows = [x for x in rows_raw if isinstance(x, dict)]
+    times_o, closes_o = _uw_rows_to_daily_series(rows)
+    if len(times_o) < 2:
+        return [], [], f"Unusual Whales: parsed {len(times_o)} daily points (need ≥2)"
+    return times_o, closes_o, ""
+
+
 # -----------------------------------------------------------------------------
 # Scan pipeline
 # -----------------------------------------------------------------------------
@@ -927,41 +1544,46 @@ def _scan_ticker_impl(
     extra_iv = f" | IV/read-through: {iv_guess:.1f}" if iv_guess is not None else ""
     row.vol_reason = reason + extra_iv
 
-    peers = fmp_stock_peers(t, fmp_key) if fmp_key else []
-    peers = [p for p in peers if p != t][:12]
+    peers, peer_src = discover_stock_peers(t, fmp_key)
+    peers = [p for p in peers if p.upper() != t][:12]
+    row.peer_source = peer_src
     row.peers_for_chart = [t] + peers[:8]
     if not peers:
-        errors.append("No peer list from FMP.")
+        errors.append(
+            "No peer list — FMP, Yahoo recommendations, and yfinance industry basket all empty "
+            "(verify ticker; check network)."
+        )
 
-    if fmp_key:
-        (
-            fwd,
-            peer_med,
-            blended,
-            sec_bench,
-            pe_map,
-            main_src,
-            mismatch,
-            dev_pct,
-        ) = fmp_forward_pe_and_peer_avg(t, peers or [t], fmp_key, sector, last)
-        row.fwd_pe = fwd
-        row.peer_median_pe = peer_med
-        row.peer_avg_pe = blended
-        row.sector_benchmark_pe = sec_bench
-        row.pe_by_ticker = pe_map
-        row.fwd_pe_source = main_src
-        row.pe_deviation_pct = dev_pct
-        row.pe_mismatch_30 = mismatch
-    else:
-        row.fwd_pe_source = "n/a"
+    fmp_for_ratios = fmp_key or ""
+    (
+        fwd,
+        peer_med,
+        blended,
+        sec_bench,
+        pe_map,
+        main_src,
+        mismatch,
+        dev_pct,
+    ) = fmp_forward_pe_and_peer_avg(t, peers or [t], fmp_for_ratios, sector, last)
+    row.fwd_pe = fwd
+    row.peer_median_pe = peer_med
+    row.peer_avg_pe = blended
+    row.sector_benchmark_pe = sec_bench
+    row.pe_by_ticker = pe_map
+    row.fwd_pe_source = main_src if fmp_key else (main_src or "yfinance / no FMP key")
+    row.pe_deviation_pct = dev_pct
+    row.pe_mismatch_30 = mismatch
 
     row.valuation_skew = valuation_skew_label(row.fwd_pe, row.peer_avg_pe, row.peer_median_pe)
 
     peer_for_llm = row.peer_avg_pe
-    filing_url = fmp_latest_10k_filing_url(t, fmp_key) if fmp_key else None
+    filing_url, _filing_src = resolve_latest_10k_filing_url(t, fmp_key or "")
 
     if not filing_url:
-        errors.append("No 10-K filing URL from FMP.")
+        errors.append(
+            "No 10-K URL — FMP limited/unavailable; SEC `data.sec.gov` submissions + atom also failed. "
+            "Set **SEC_EDGAR_USER_AGENT** in `.env` to `YourApp your@email` (required by sec.gov)."
+        )
         row.llm_summary = "No 10-K URL."
         row.llm_flag = "Unknown"
         row.llm_provider = "n/a"
@@ -1033,6 +1655,10 @@ def _scan_ticker_impl(
     return row
 
 
+def is_actionable_recommendation(row: ScanRow) -> bool:
+    return row.recommendation != "Skip"
+
+
 @st.cache_data(ttl=SCAN_CACHE_TTL_SEC, show_spinner=False)
 def scan_ticker_cached(
     ticker: str,
@@ -1052,6 +1678,60 @@ def scan_ticker_cached(
         polygon_key=polygon_key,
         uw_key=uw_key,
     )
+
+
+def _pe_map_lookup(pe_by_ticker: dict, sym: str) -> Optional[float]:
+    v = pe_by_ticker.get(sym)
+    if v is not None:
+        try:
+            f = float(v)
+            return f if f > 0 else None
+        except (TypeError, ValueError):
+            pass
+    su = sym.upper()
+    for k, val in (pe_by_ticker or {}).items():
+        if str(k).upper() == su:
+            try:
+                f = float(val)
+                return f if f > 0 else None
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def render_peer_ticker_labels(row: ScanRow) -> None:
+    """Show competitor tickers and which ones contributed P/E to the median / chart."""
+    t = row.ticker.upper()
+    comps = [str(p).upper().strip() for p in row.peers_for_chart if str(p).upper().strip() != t]
+    if not comps:
+        st.caption(
+            "_No peer set — comparison leans on sector benchmark only._"
+        )
+        return
+    src = (row.peer_source or "").strip()
+    if src == "Yahoo":
+        label = "Related symbols (Yahoo — used when FMP peers unavailable)"
+    elif src == "FMP":
+        label = "Competitors (FMP stock peers)"
+    elif src == "yfinance-industry":
+        label = "Industry basket (yfinance — when FMP & Yahoo peers unavailable)"
+    else:
+        label = "Comparison set"
+    st.markdown("**" + label + ":** " + " · ".join(f"`{p}`" for p in comps))
+    used = [p for p in comps if _pe_map_lookup(row.pe_by_ticker, p) is not None]
+    if not used:
+        st.caption("_No usable P/E for peers this run — chart may show only your ticker._")
+        return
+    missing = [p for p in comps if p not in used]
+    if missing:
+        st.caption(
+            "**P/E in median & bars:** "
+            + ", ".join(f"`{x}`" for x in used)
+            + f" ({len(used)}). _No multiple:_ "
+            + ", ".join(f"`{x}`" for x in missing)
+        )
+    else:
+        st.caption(f"**P/E in median & bars:** all **{len(used)}** peers above (and **{t}** in chart).")
 
 
 def pe_bar_figure(row: ScanRow) -> Optional[go.Figure]:
@@ -1083,7 +1763,47 @@ def pe_bar_figure(row: ScanRow) -> Optional[go.Figure]:
         yaxis_title="P/E",
         height=300,
     )
+    if row.peer_avg_pe is not None and row.peer_avg_pe > 0:
+        fig.add_hline(
+            y=float(row.peer_avg_pe),
+            line_dash="dash",
+            line_color="rgba(196, 181, 253, 0.65)",
+            annotation_text="blended benchmark",
+            annotation_position="top right",
+        )
     return fig
+
+
+@st.cache_data(ttl=SCAN_CACHE_TTL_SEC, show_spinner=False)
+def uw_price_chart_figure_cached(ticker: str, uw_key: str) -> tuple[Optional[go.Figure], str]:
+    t = ticker.upper().strip()
+    dates, closes, err = fetch_uw_stock_ohlc_1y(t, uw_key)
+    if err or not dates:
+        return None, err or "no price data"
+    fig = go.Figure(
+        data=[
+            go.Scatter(
+                x=dates,
+                y=closes,
+                mode="lines",
+                line=dict(color="#4ade80", width=2),
+                name="Close",
+                hovertemplate="%{x|%Y-%m-%d}<br>$%{y:.2f}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(20,12,35,0.6)",
+        font_color="#e9d8ff",
+        title="Unusual Whales — price (1Y daily)",
+        margin=dict(l=8, r=8, t=36, b=8),
+        yaxis_title="Close",
+        height=280,
+        showlegend=False,
+    )
+    return fig, ""
 
 
 def filtered_to_csv(rows: list[ScanRow]) -> str:
@@ -1114,24 +1834,46 @@ def main() -> None:
     st.set_page_config(page_title=PAGE_TITLE, layout="wide", page_icon="📊")
     st.markdown(MILLENNIALITY_CSS, unsafe_allow_html=True)
 
+    if auth_required():
+        if not supabase_configured():
+            st.error(
+                "**REQUIRE_LOGIN** is on but Supabase is not configured correctly. In **Supabase → Project Settings → "
+                "API**, copy your real **Project URL** (looks like `https://abcdefgh.supabase.co`) into **`SUPABASE_URL`** "
+                "in `.env` — not the placeholder `your-project.supabase.co`. Paste the **service_role** key into "
+                "**`SUPABASE_SERVICE_ROLE_KEY`**, run **`schema_auth.sql`** in the SQL editor, then restart Streamlit."
+            )
+            st.stop()
+        ensure_bootstrap_admin_from_env()
+        render_auth_gate()
+        logout_control()
+        render_admin_panel()
+
     keys = _env_keys()
     if not keys["fmp"]:
-        st.error("**FMP_API_KEY** is missing. Add it to `.env` or your environment and restart.")
-        st.stop()
+        st.warning(
+            "**FMP_API_KEY** is missing — discovery uses **Yahoo** screeners only; P/E uses **yfinance** + SEC fallbacks. "
+            "Add FMP back if your quota returns."
+        )
 
     with st.sidebar:
-        st.caption("API keys loaded from **`.env`** / environment (**FMP** required). Nothing is entered here.")
+        if supabase_configured() and not auth_required():
+            st.info(
+                "**Sign-in is off.** Add **`REQUIRE_LOGIN=true`** to `.env` and **restart Streamlit** to show login."
+            )
+        st.caption(
+            "API keys from **`.env`** (FMP optional — Yahoo + SEC + yfinance cover core scanning). Nothing is entered here."
+        )
         st.divider()
         st.caption(
             f"Scan cache: **{SCAN_CACHE_TTL_SEC // 60} min** TTL · "
-            f"Display cutoff: score ≥ **{MIN_DISPLAY_SCORE}**"
+            f"Shown names: **actionable** (not Skip) and score ≥ **{MIN_DISPLAY_SCORE}**"
         )
 
     st.markdown('<span class="millenniallity-badge">@millenniallity</span>', unsafe_allow_html=True)
     st.title("Millenniallity Volatility Mismatch Scanner")
     st.markdown(
-        "**Pure discovery:** each run pulls a fresh **high-beta, liquid** universe from FMP and scores what to "
-        "**investigate next** — not a watchlist you maintain here. "
+        "**Pure discovery:** each run pulls a fresh **liquid** universe from **FMP** (or **Yahoo** if FMP list APIs "
+        "are unavailable on your plan) and scores what to **investigate next** — not a watchlist you maintain here. "
         "**Rich** P/E vs peers → **Buy Puts** bias; **cheap** mismatch → calls / stock. Air-gapped for **Public.com**."
     )
 
@@ -1155,15 +1897,24 @@ def main() -> None:
     if not xai_key:
         st.warning("**XAI_API_KEY** missing — narrative scoring disabled until set in `.env`.")
 
-    wide, universe_source = fmp_high_beta_universe(fmp_key, VOLATILE_UNIVERSE_LIMIT)
+    wide, universe_source = build_discovery_universe(fmp_key, VOLATILE_UNIVERSE_LIMIT)
     if not wide:
         st.error(
-            "**No symbols from FMP.** Confirm `FMP_API_KEY` in `.env`, that the key is active at "
-            "[financialmodelingprep.com](https://site.financialmodelingprep.com/developer/docs/pricing), "
-            "and try again. (Screener + actives/gainers endpoints were tried.)"
+            "**No discovery symbols.** FMP **stable company-screener** is often **402** (paid) on lower tiers; "
+            "**v3** actives/gainers can return **403** (“Legacy Endpoint”) for keys issued after Aug 2025 — so the "
+            "symbol list can be empty even with a working key. We also tried **Yahoo Finance** predefined screeners "
+            "(check network if still empty). Per-ticker FMP routes like **stable/ratios** may still work; upgrade "
+            "FMP or use a grandfathered key for full list APIs. "
+            "[Pricing](https://site.financialmodelingprep.com/developer/docs/pricing)"
         )
         st.stop()
-    if "stock_market" in universe_source:
+    if universe_source.startswith("yahoo"):
+        st.info(
+            f"**Universe source:** `{universe_source}` — FMP did not return a symbol list (screener paywall or "
+            "legacy list block). Using **Yahoo** liquid movers for discovery; **FMP** still powers ratios, peers, "
+            "and filings where your key allows."
+        )
+    elif "stock_market" in universe_source:
         st.info(
             f"**Universe source:** `{universe_source}` — company **screener** returned no rows for your key/filters; "
             "using **high-liquidity movers** instead (still fine for discovery). "
@@ -1212,7 +1963,8 @@ def main() -> None:
 
     progress.empty()
 
-    filtered = [r for r in results if r.mismatch_score >= MIN_DISPLAY_SCORE]
+    actionable_pool = [r for r in results if is_actionable_recommendation(r)]
+    filtered = [r for r in actionable_pool if r.mismatch_score >= MIN_DISPLAY_SCORE]
     filtered.sort(key=lambda r: r.mismatch_score, reverse=True)
 
     summary_records = [
@@ -1225,23 +1977,44 @@ def main() -> None:
             "Vol Reason": r.vol_reason,
             "LLM Flag": r.llm_flag,
         }
-        for r in results
+        for r in filtered
     ]
-    sum_df = pd.DataFrame(summary_records).sort_values("Mismatch Score", ascending=False)
+    sum_df = (
+        pd.DataFrame(summary_records).sort_values("Mismatch Score", ascending=False)
+        if summary_records
+        else pd.DataFrame()
+    )
 
-    st.subheader("Results overview")
-    st.dataframe(sum_df, use_container_width=True, hide_index=True)
+    st.subheader("Results overview (actionable only)")
+    if sum_df.empty:
+        st.caption("No rows to show — see note below.")
+    else:
+        st.dataframe(sum_df, use_container_width=True, hide_index=True)
 
     st.download_button(
-        label="Download CSV (score-filtered list)",
+        label="Download CSV (actionable & score-filtered)",
         data=filtered_to_csv(filtered),
         file_name=f"millenniallity_scan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
         mime="text/csv",
     )
 
-    st.subheader(f"Detail — score ≥ {MIN_DISPLAY_SCORE} ({'no rows' if not filtered else len(filtered)} names)")
+    st.subheader(
+        f"Detail — actionable, score ≥ {MIN_DISPLAY_SCORE} "
+        f"({'no rows' if not filtered else len(filtered)} names)"
+    )
     if not filtered:
-        st.warning(f"No names met score ≥ {MIN_DISPLAY_SCORE}. Re-run later or widen the FMP screener in code.")
+        if not results:
+            st.warning("Scan produced no rows.")
+        elif not actionable_pool:
+            st.warning(
+                "**No actionable ideas** — every name was rated **Skip** (volatility / P&E / narrative gates). "
+                "Re-run later or adjust scoring in code if you want more signals."
+            )
+        else:
+            st.warning(
+                f"**{len(actionable_pool)}** non-Skip name(s) below score **{MIN_DISPLAY_SCORE}**; "
+                "raising the cutoff in code would show them (not recommended unless you widen mismatch rules)."
+            )
 
     for r in filtered:
         title = f"{r.ticker} · {r.mismatch_score:.0f} · {r.recommendation}"
@@ -1256,6 +2029,12 @@ def main() -> None:
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.caption("Not enough peer P/E data to chart.")
+                render_peer_ticker_labels(r)
+                uw_fig, uw_err = uw_price_chart_figure_cached(r.ticker, uw_key)
+                if uw_fig:
+                    st.plotly_chart(uw_fig, use_container_width=True)
+                elif uw_err:
+                    st.caption(f"_Unusual Whales 1Y price: {uw_err}_")
                 st.metric("Stock P/E vs benchmark", f"{r.fwd_pe} vs {r.peer_avg_pe}")
                 st.caption(
                     f"Peer median **{r.peer_median_pe}** · Sector bench **{r.sector_benchmark_pe}** · _{r.fwd_pe_source}_"
@@ -1282,6 +2061,7 @@ def main() -> None:
                 )
             if r.errors:
                 st.error("Notes: " + "; ".join(r.errors))
+            render_grok_followup_chat(r.ticker, r, xai_key)
 
     st.markdown(
         '<div class="mill-footer">Built for Public.com options edge — volatile P/E mismatches only</div>',
