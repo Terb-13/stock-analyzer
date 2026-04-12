@@ -950,15 +950,17 @@ def _fmp_response_to_symbols(data: Any) -> list[str]:
     return out
 
 
-def fmp_high_beta_universe(api_key: str, limit: int = 100) -> tuple[list[str], str]:
+def fmp_high_beta_universe(api_key: str, limit: int = 100) -> tuple[list[str], str, str]:
     """
     Build a volatile discovery list: try **stable company-screener**, then legacy **v3 stock-screener**,
     then **most actives / gainers** (usually allowed on free tier if screener is paywalled or params reject).
 
-    Returns `(symbols, source_label)` so the UI can explain which path succeeded.
+    Returns `(symbols, source_label, fmp_debug_text)` — the third string logs HTTP status for each FMP
+    attempt (for the Debug panel when the universe is empty or misbehaving).
     """
+    debug_lines: list[str] = []
     if not api_key:
-        return [], "none"
+        return [], "none", "FMP: no API key — skipped high-beta universe calls."
 
     attempts: list[tuple[str, dict[str, str]]] = [
         (
@@ -1016,26 +1018,45 @@ def fmp_high_beta_universe(api_key: str, limit: int = 100) -> tuple[list[str], s
         ),
     ]
 
+    primary_logged = False
     for base, params in attempts:
         url = f"{base}?{urllib.parse.urlencode(params)}"
-        data, err = _safe_get_json(url)
-        if err:
+        short = "stable/company-screener" if "stable" in base else "v3/stock-screener"
+        try:
+            r = requests.get(url, timeout=REQUEST_TIMEOUT)
+            if not primary_logged and "stable" in base and "betaMoreThan" in params:
+                debug_lines.append(
+                    f"Primary high-beta universe call ({short}, strict filters): HTTP {r.status_code}"
+                )
+                primary_logged = True
+            if r.status_code != 200:
+                debug_lines.append(f"{short}: HTTP {r.status_code}")
+                continue
+            data = r.json()
+        except Exception as e:
+            debug_lines.append(f"{short}: {e}")
             continue
         syms = _fmp_response_to_symbols(data)
         if syms:
             label = "stable/company-screener" if "stable" in base else "v3/stock-screener"
-            return syms[:limit], label
+            return syms[:limit], label, "\n".join(debug_lines)
 
     for tail in ("stock_market/actives", "stock_market/gainers", "stock_market/losers"):
         url = f"{FMP_BASE}/api/v3/{tail}?apikey={api_key}"
-        data, err = _safe_get_json(url)
-        if err:
+        try:
+            r = requests.get(url, timeout=REQUEST_TIMEOUT)
+            debug_lines.append(f"v3/{tail}: HTTP {r.status_code}")
+            if r.status_code != 200:
+                continue
+            data = r.json()
+        except Exception as e:
+            debug_lines.append(f"v3/{tail}: {e}")
             continue
         syms = _fmp_response_to_symbols(data)
         if syms:
-            return syms[:limit], f"v3/{tail}"
+            return syms[:limit], f"v3/{tail}", "\n".join(debug_lines)
 
-    return [], "none"
+    return [], "none", "\n".join(debug_lines) if debug_lines else "FMP: no HTTP lines recorded."
 
 
 YAHOO_PREDEFINED_SCREENER_IDS = ("most_actives", "day_gainers", "day_losers")
@@ -1087,15 +1108,15 @@ def yahoo_screener_universe(limit: int) -> tuple[list[str], str]:
     return seen[:limit], "yahoo/" + "+".join(used) if used else "yahoo/none"
 
 
-def build_discovery_universe(fmp_api_key: str, limit: int) -> tuple[list[str], str]:
+def build_discovery_universe(fmp_api_key: str, limit: int) -> tuple[list[str], str, str]:
     """FMP volatile universe first; if empty (402/403 paywalls), Yahoo predefined screeners."""
-    syms, src = fmp_high_beta_universe(fmp_api_key, limit)
+    syms, src, fmp_dbg = fmp_high_beta_universe(fmp_api_key, limit)
     if syms:
-        return syms, src
+        return syms, src, fmp_dbg
     y_syms, y_src = yahoo_screener_universe(limit)
     if y_syms:
-        return y_syms, y_src
-    return [], "none"
+        return y_syms, y_src, fmp_dbg + "\nUniverse fallback: Yahoo predefined screeners (FMP list empty)."
+    return [], "none", fmp_dbg + "\nUniverse fallback: Yahoo also returned no symbols."
 
 
 # -----------------------------------------------------------------------------
@@ -2014,6 +2035,23 @@ def filtered_to_csv(rows: list[ScanRow], *, burry_mode: bool = False) -> str:
     return buf.getvalue()
 
 
+def _llm_summary_count_ok(rows: list[ScanRow]) -> int:
+    """Count tickers where xAI returned a narrative (not placeholder / error-only)."""
+    return sum(1 for r in rows if (r.llm_provider or "").strip() == "xAI")
+
+
+def _collect_per_ticker_error_lines(rows: list[ScanRow]) -> list[str]:
+    lines: list[str] = []
+    for r in rows:
+        for e in r.errors or []:
+            es = str(e).strip()
+            if es:
+                lines.append(f"**{r.ticker}:** {es}")
+        if r.vol_reason == "error" and r.llm_summary and str(r.llm_summary).startswith("Fatal error"):
+            lines.append(f"**{r.ticker}:** {r.llm_summary}")
+    return lines
+
+
 # -----------------------------------------------------------------------------
 # Auth (streamlit-authenticator — self-contained in this file)
 # -----------------------------------------------------------------------------
@@ -2292,7 +2330,7 @@ def main() -> None:
         )
 
     uni_limit = BURRY_UNIVERSE_LIMIT if burry_mode else VOLATILE_UNIVERSE_LIMIT
-    wide, universe_source = build_discovery_universe(fmp_key, uni_limit)
+    wide, universe_source, fmp_universe_debug = build_discovery_universe(fmp_key, uni_limit)
     if not wide:
         st.error(
             "**No discovery symbols.** FMP **stable company-screener** is often **402** (paid) on lower tiers; "
@@ -2363,6 +2401,32 @@ def main() -> None:
     actionable_pool = [r for r in results if is_actionable_recommendation(r)]
     filtered = [r for r in actionable_pool if r.mismatch_score >= MIN_DISPLAY_SCORE]
     filtered.sort(key=lambda r: _burry_results_sort_key(r, burry_mode))
+
+    total_scanned = len(results)
+    n_vol_pass = sum(1 for r in results if r.vol_ok)
+    n_pe_ok = sum(1 for r in results if r.fwd_pe is not None)
+    n_llm_ok = _llm_summary_count_ok(results)
+    n_final = len(filtered)
+    n_fail_vol = sum(1 for r in results if not r.vol_ok)
+    n_fail_pe = sum(1 for r in results if r.fwd_pe is None)
+    n_skip_all = sum(1 for r in results if r.recommendation == "Skip")
+    n_actionable = len(actionable_pool)
+    n_below_score = max(0, n_actionable - n_final)
+    err_lines = _collect_per_ticker_error_lines(results)
+
+    st.subheader("Scan Summary")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Tickers scanned", total_scanned)
+    m2.metric("Passed volatility filter", n_vol_pass)
+    m3.metric("Forward P/E resolved", n_pe_ok)
+    m4.metric("LLM summaries (xAI)", n_llm_ok)
+    m5.metric("Final results shown", n_final)
+    if not filtered:
+        st.info(
+            "**No stocks passed all filters.** Try lowering **`MIN_DISPLAY_SCORE`** in code (currently "
+            f"**{MIN_DISPLAY_SCORE}**), run **Burry Mode** for a wider Top {BURRY_UNIVERSE_LIMIT} universe, "
+            "or verify **FMP_API_KEY**, **SEC_API_KEY** (10-K extraction), and **XAI_API_KEY** in `.env` / Secrets."
+        )
 
     summary_records = []
     for r in filtered:
@@ -2469,6 +2533,24 @@ def main() -> None:
             if r.errors:
                 st.error("Notes: " + "; ".join(r.errors))
             render_grok_followup_chat(r.ticker, r, xai_key)
+
+    with st.expander("Debug / Errors", expanded=False):
+        st.markdown("**FMP high-beta universe (HTTP trace)**")
+        st.code(fmp_universe_debug or "(empty)", language=None)
+        st.markdown("**Failure counts (major steps)**")
+        st.markdown(
+            f"- **Volatility filter failed:** {n_fail_vol} / {total_scanned}\n"
+            f"- **Forward P/E missing:** {n_fail_pe} / {total_scanned}\n"
+            f"- **Recommendation = Skip:** {n_skip_all} / {total_scanned}\n"
+            f"- **Actionable but below score cutoff ({MIN_DISPLAY_SCORE}):** {n_below_score} "
+            f"(actionable non-Skip: **{n_actionable}**)"
+        )
+        if err_lines:
+            st.markdown("**Errors / notes per ticker**")
+            for line in err_lines:
+                st.markdown(f"- {line}")
+        else:
+            st.caption("_No per-ticker error strings collected (see Scan Summary if results are empty)._")
 
     st.markdown(
         '<div class="mill-footer">Built for Public.com options edge — volatile P/E mismatches only</div>',
