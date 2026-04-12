@@ -1,4 +1,6 @@
 .env
+auth_users.json
+.streamlit/secrets.toml
 __pycache__/
 *.pyc
 .venv/

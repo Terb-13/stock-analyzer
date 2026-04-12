@@ -6,10 +6,12 @@ API keys: `.env` / environment variables only (never shown in UI).
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import statistics
 import urllib.parse
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
@@ -33,14 +35,26 @@ try:
 except ImportError:
     ExtractorApi = None  # type: ignore
 
-from auth_access import (
-    auth_required,
-    ensure_bootstrap_admin_from_env,
-    logout_control,
-    render_admin_panel,
-    render_auth_gate,
-    supabase_configured,
-)
+import streamlit_authenticator as stauth
+
+try:
+    from streamlit_authenticator.utilities.hasher import Hasher
+except ImportError:
+    from streamlit_authenticator import Hasher
+
+
+def _hash_password_for_storage(plain: str) -> str:
+    if hasattr(Hasher, "hash_list"):
+        out = Hasher.hash_list([plain])  # type: ignore[attr-defined]
+        if isinstance(out, list) and out:
+            return str(out[0])
+        return str(out)
+    if hasattr(Hasher, "hash"):
+        return str(Hasher.hash(plain))  # type: ignore[attr-defined]
+    gen = Hasher([plain]).generate()  # type: ignore[call-arg]
+    if isinstance(gen, list) and gen:
+        return str(gen[0])
+    return str(gen)
 # -----------------------------------------------------------------------------
 # Branding & config
 # -----------------------------------------------------------------------------
@@ -114,6 +128,7 @@ SCAN_CACHE_TTL_SEC = 3600
 HIGH_SCORE_EXPAND_THRESHOLD = 65
 MIN_DISPLAY_SCORE = 45
 VOLATILE_UNIVERSE_LIMIT = 120
+BURRY_UNIVERSE_LIMIT = 150
 
 REQUEST_TIMEOUT = 25
 
@@ -196,13 +211,26 @@ def sec_submissions_latest_10k_primary_url(ticker: str) -> Optional[str]:
     return f"https://www.sec.gov/Archives/edgar/data/{cik_numeric}/{acc_nodash}/{doc}"
 
 
+def _env_or_secret(key: str) -> str:
+    """Prefer `os.environ` (`.env` locally); fall back to `st.secrets` (Streamlit Community Cloud)."""
+    v = os.getenv(key, "").strip()
+    if v:
+        return v
+    try:
+        if hasattr(st, "secrets") and key in st.secrets:
+            return str(st.secrets[key]).strip()
+    except Exception:
+        pass
+    return ""
+
+
 def _env_keys() -> dict[str, str]:
     return {
-        "fmp": os.getenv("FMP_API_KEY", "").strip(),
-        "sec": os.getenv("SEC_API_KEY", "").strip(),
-        "xai": os.getenv("XAI_API_KEY", "").strip(),
-        "uw": os.getenv("UNUSUAL_WHALES_API_KEY", "").strip(),
-        "polygon": os.getenv("POLYGON_API_KEY", "").strip(),
+        "fmp": _env_or_secret("FMP_API_KEY"),
+        "sec": _env_or_secret("SEC_API_KEY"),
+        "xai": _env_or_secret("XAI_API_KEY"),
+        "uw": _env_or_secret("UNUSUAL_WHALES_API_KEY"),
+        "polygon": _env_or_secret("POLYGON_API_KEY"),
     }
 
 
@@ -225,6 +253,29 @@ def _safe_get_json(url: str) -> tuple[Any, Optional[str]]:
 
 XAI_CHAT_URL = "https://api.x.ai/v1/chat/completions"
 LLM_TIMEOUT = 120
+
+
+def _xai_message_content_to_str(content: Any) -> str:
+    """xAI/OpenAI-style content is usually str; reasoning models may return list segments."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for p in content:
+            if isinstance(p, dict):
+                t = p.get("text")
+                if isinstance(t, str):
+                    parts.append(t)
+                else:
+                    nested = p.get("content")
+                    if isinstance(nested, str):
+                        parts.append(nested)
+            elif isinstance(p, str):
+                parts.append(p)
+        return "".join(parts).strip()
+    return str(content).strip()
 
 
 def _xai_error_detail(response: requests.Response) -> str:
@@ -261,12 +312,15 @@ def xai_chat_completion(api_key: str, user_content: str) -> str:
     if r.status_code >= 400:
         detail = _xai_error_detail(r)
         raise RuntimeError(f"{r.status_code} {XAI_CHAT_URL} — {detail}")
-    data = r.json()
+    try:
+        data = r.json()
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"xAI: invalid JSON ({e.message})") from e
     choices = data.get("choices") or []
     if not choices:
         raise ValueError("xAI response missing choices")
     msg = choices[0].get("message") or {}
-    return (msg.get("content") or "").strip()
+    return _xai_message_content_to_str(msg.get("content"))
 
 
 def xai_chat_messages(
@@ -308,12 +362,15 @@ def xai_chat_messages(
     if r.status_code >= 400:
         detail = _xai_error_detail(r)
         raise RuntimeError(f"{r.status_code} {XAI_CHAT_URL} — {detail}")
-    data = r.json()
+    try:
+        data = r.json()
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"xAI: invalid JSON ({e.message})") from e
     choices = data.get("choices") or []
     if not choices:
         raise ValueError("xAI response missing choices")
     msg = choices[0].get("message") or {}
-    return (msg.get("content") or "").strip()
+    return _xai_message_content_to_str(msg.get("content"))
 
 
 def _grok_scan_context_system_message(row: ScanRow) -> str:
@@ -395,9 +452,13 @@ def render_grok_followup_chat(ticker: str, row: ScanRow, xai_key: str) -> None:
                 st.rerun()
 
         for msg in st.session_state[sess_hist]:
-            role = msg.get("role", "user")
-            with st.chat_message(role):
-                st.markdown(msg.get("content", ""))
+            role_raw = (msg.get("role") or "user").strip().lower()
+            label = "You" if role_raw == "user" else "Grok"
+            body = msg.get("content")
+            text = body if isinstance(body, str) else _xai_message_content_to_str(body)
+            with st.container(border=True):
+                st.caption(label)
+                st.markdown(text or "_—_")
 
         with st.form(f"grok_chat_form_{safe_t}", clear_on_submit=True):
             prompt = st.text_area(
@@ -1100,6 +1161,29 @@ def valuation_skew_label(
     return "inline"
 
 
+def burry_fifty_pct_above_blended(fwd: Optional[float], blended: Optional[float]) -> bool:
+    """True when forward P/E is ≥50% above blended peer/sector benchmark (Burry overvaluation bar)."""
+    if fwd is None or blended is None or blended <= 0:
+        return False
+    return fwd >= blended * 1.5
+
+
+def burry_large_insider_extraction(
+    insider_net_seller: bool,
+    insider_buy_shares: float,
+    insider_sell_shares: float,
+    insider_net_shares: float,
+) -> bool:
+    """Heuristic for owner / insider cash-out scale (large sells vs buys)."""
+    if not insider_net_seller:
+        return False
+    if insider_sell_shares >= max(insider_buy_shares * 2.5, 1.0) and insider_sell_shares >= 50_000.0:
+        return True
+    if abs(insider_net_shares) >= 250_000.0:
+        return True
+    return False
+
+
 def run_llm_valuation_mismatch(
     ticker: str,
     fwd_pe: Optional[float],
@@ -1181,6 +1265,7 @@ class ScanRow:
     recommendation: str = "Skip"
     option_suggestion: str = ""
     errors: list[str] = field(default_factory=list)
+    burry_fit: str = ""
 
 
 def score_row(
@@ -1191,6 +1276,11 @@ def score_row(
     narrative_text: str,
     *,
     insider_bonus: float = 0.0,
+    burry_mode: bool = False,
+    burry_extreme_rich: bool = False,
+    burry_insider_bearish_combo: bool = False,
+    burry_large_extraction: bool = False,
+    valuation_skew: str = "unknown",
 ) -> float:
     if not vol_ok:
         return 0.0
@@ -1210,6 +1300,15 @@ def score_row(
     if llm_flag in ("Bearish", "Bullish"):
         s += 5.0
     s += insider_bonus
+    if burry_mode:
+        if burry_extreme_rich:
+            s += 30.0
+        if burry_insider_bearish_combo:
+            s += 18.0
+            if burry_large_extraction:
+                s += 10.0
+        if valuation_skew == "cheap" and llm_flag == "Bullish":
+            s += 8.0
     return max(0.0, min(100.0, s))
 
 
@@ -1221,67 +1320,110 @@ def recommend_trade(
     contradiction_yes: bool,
     valuation_skew: str,
     insider_net_seller: bool,
+    *,
+    burry_mode: bool = False,
+    burry_extreme_rich: bool = False,
+    burry_large_extraction: bool = False,
 ) -> str:
     """
     Discovery bias: rich forward P/E vs peers/sector → default **Buy Puts** (e.g. multiple ~2× peers + insider selling).
     Cheap mismatch → **Buy Calls** / **Buy Stock** for recovery-style mispricing.
+    Burry mode: relabel strongest stretched-multiple + insider / bearish setups as **Burry Put Candidate**.
     """
     if not vol_ok:
         return "Skip"
     if not pe_mismatch and score < 48:
         return "Skip"
 
-    rich = valuation_skew == "rich"
-    cheap = valuation_skew == "cheap"
+    base = "Skip"
 
     if pe_mismatch and valuation_skew == "unknown":
         if insider_net_seller or llm_flag == "Bearish":
-            return "Buy Puts"
-        if llm_flag == "Bullish":
-            return "Buy Calls (CVNA-style)"
-        if score >= 56:
-            return "Buy Stock"
+            base = "Buy Puts"
+        elif llm_flag == "Bullish":
+            base = "Buy Calls (CVNA-style)"
+        elif score >= 56:
+            base = "Buy Stock"
 
     # Stretched multiple vs industry → puts-first (e.g. ~46x vs ~18–20x peers; insider selling reinforces)
-    if pe_mismatch and rich:
-        return "Buy Puts"
+    if base == "Skip" and pe_mismatch and valuation_skew == "rich":
+        base = "Buy Puts"
 
-    if pe_mismatch and cheap:
+    if base == "Skip" and pe_mismatch and valuation_skew == "cheap":
         if insider_net_seller and (llm_flag == "Bearish" or contradiction_yes):
-            return "Buy Puts"
-        if llm_flag == "Bullish":
-            return "Buy Calls (CVNA-style)"
-        if score >= 55:
-            return "Buy Stock"
-        if score >= 48:
-            return "Buy Stock"
+            base = "Buy Puts"
+        elif llm_flag == "Bullish":
+            base = "Buy Calls (CVNA-style)"
+        elif score >= 55:
+            base = "Buy Stock"
+        elif score >= 48:
+            base = "Buy Stock"
 
     # Large % deviation but ratio inside inline band — use narrative + score
-    if pe_mismatch and valuation_skew == "inline":
+    if base == "Skip" and pe_mismatch and valuation_skew == "inline":
         if llm_flag == "Bearish" or insider_net_seller:
-            return "Buy Puts"
-        if llm_flag == "Bullish":
-            return "Buy Calls (CVNA-style)"
-        if contradiction_yes:
-            return "Buy Puts"
-        if score >= 58:
-            return "Buy Stock"
+            base = "Buy Puts"
+        elif llm_flag == "Bullish":
+            base = "Buy Calls (CVNA-style)"
+        elif contradiction_yes:
+            base = "Buy Puts"
+        elif score >= 58:
+            base = "Buy Stock"
 
-    if pe_mismatch and contradiction_yes:
+    if base == "Skip" and pe_mismatch and contradiction_yes:
         if llm_flag == "Bearish":
-            return "Buy Puts"
-        if llm_flag == "Bullish":
-            return "Buy Calls (CVNA-style)"
+            base = "Buy Puts"
+        elif llm_flag == "Bullish":
+            base = "Buy Calls (CVNA-style)"
 
-    if score >= 62 and pe_mismatch:
+    if base == "Skip" and score >= 62 and pe_mismatch:
         if llm_flag == "Bearish":
-            return "Buy Puts"
-        if llm_flag == "Bullish":
-            return "Buy Calls (CVNA-style)"
-    if score >= 52 and pe_mismatch:
-        return "Buy Stock"
+            base = "Buy Puts"
+        elif llm_flag == "Bullish":
+            base = "Buy Calls (CVNA-style)"
+    if base == "Skip" and score >= 52 and pe_mismatch:
+        base = "Buy Stock"
 
-    return "Skip"
+    if burry_mode and base == "Buy Puts":
+        if burry_extreme_rich and (
+            llm_flag == "Bearish" or (insider_net_seller and burry_large_extraction)
+        ):
+            return "Burry Put Candidate"
+        return "Buy Puts"
+    return base
+
+
+def burry_fit_label(
+    burry_mode: bool,
+    burry_extreme_rich: bool,
+    insider_net_seller: bool,
+    llm_flag: str,
+    large_extraction: bool,
+    valuation_skew: str,
+    fwd: Optional[float],
+    blended: Optional[float],
+    recommendation: str,
+) -> str:
+    """Short label for table/cards when Burry Mode is on."""
+    if not burry_mode:
+        return ""
+    if valuation_skew == "cheap" and llm_flag == "Bullish":
+        return "Deep value long (Burry)"
+    if recommendation == "Burry Put Candidate":
+        return (
+            "Burry Put — extreme vs bench + seller/Bearish (e.g. CVNA ~46× vs ~18–20× peers + owner cash-out)"
+        )
+    if burry_extreme_rich and (llm_flag == "Bearish" or insider_net_seller):
+        pe_hint = ""
+        if fwd is not None and blended is not None and blended > 0:
+            pe_hint = f" ~{fwd:.0f}× vs ~{blended:.0f}× bench"
+        ex = " + large insider extraction" if large_extraction else ""
+        return f"Puts bias — stretched multiple{pe_hint}{ex}"
+    if burry_extreme_rich:
+        return "Extreme vs blended benchmark (≥50%)"
+    if insider_net_seller and llm_flag == "Bearish":
+        return "Insider selling + Bearish LLM"
+    return "—"
 
 
 def suggest_options(symbol: str, last: Optional[float], *, weeks: tuple[int, ...] = (1, 2, 3, 4)) -> str:
@@ -1510,6 +1652,7 @@ def _scan_ticker_impl(
     xai_key: str,
     polygon_key: str,
     uw_key: str,
+    burry_mode: bool = False,
 ) -> ScanRow:
     errors: list[str] = []
     t = ticker.upper().strip()
@@ -1631,6 +1774,16 @@ def _scan_ticker_impl(
             insider_bonus = 12.0
         elif row.valuation_skew == "cheap" and ins.net_buyer:
             insider_bonus = 10.0
+    burry_extreme_rich = burry_mode and burry_fifty_pct_above_blended(row.fwd_pe, row.peer_avg_pe)
+    burry_large_ex = burry_large_insider_extraction(
+        row.insider_net_seller,
+        row.insider_buy_shares,
+        row.insider_sell_shares,
+        row.insider_net_shares,
+    )
+    burry_insider_bearish_combo = burry_mode and row.insider_net_seller and row.llm_flag == "Bearish"
+    if burry_mode and row.pe_mismatch_30 and burry_extreme_rich and row.insider_net_seller:
+        insider_bonus = max(insider_bonus, 12.0) + 6.0
     row.score_insider_bonus = insider_bonus
 
     row.mismatch_score = score_row(
@@ -1640,6 +1793,11 @@ def _scan_ticker_impl(
         row.llm_flag,
         row.llm_summary,
         insider_bonus=insider_bonus,
+        burry_mode=burry_mode,
+        burry_extreme_rich=burry_extreme_rich,
+        burry_insider_bearish_combo=burry_insider_bearish_combo,
+        burry_large_extraction=burry_large_ex,
+        valuation_skew=row.valuation_skew,
     )
     row.recommendation = recommend_trade(
         row.vol_ok,
@@ -1649,6 +1807,20 @@ def _scan_ticker_impl(
         row.narrative_contradiction == "Yes",
         row.valuation_skew,
         row.insider_net_seller,
+        burry_mode=burry_mode,
+        burry_extreme_rich=burry_extreme_rich,
+        burry_large_extraction=burry_large_ex,
+    )
+    row.burry_fit = burry_fit_label(
+        burry_mode,
+        burry_extreme_rich,
+        row.insider_net_seller,
+        row.llm_flag,
+        burry_large_ex,
+        row.valuation_skew,
+        row.fwd_pe,
+        row.peer_avg_pe,
+        row.recommendation,
     )
     row.option_suggestion = suggest_options(t, last or yv.last_close)
     row.errors = errors
@@ -1657,6 +1829,18 @@ def _scan_ticker_impl(
 
 def is_actionable_recommendation(row: ScanRow) -> bool:
     return row.recommendation != "Skip"
+
+
+def _burry_results_sort_key(row: ScanRow, burry_mode: bool) -> tuple:
+    if not burry_mode:
+        return (-row.mismatch_score,)
+    pri = {
+        "Burry Put Candidate": 0,
+        "Buy Puts": 1,
+        "Buy Calls (CVNA-style)": 2,
+        "Buy Stock": 3,
+    }.get(row.recommendation, 4)
+    return (pri, -row.mismatch_score)
 
 
 @st.cache_data(ttl=SCAN_CACHE_TTL_SEC, show_spinner=False)
@@ -1668,6 +1852,7 @@ def scan_ticker_cached(
     xai_key: str,
     polygon_key: str,
     uw_key: str,
+    burry_mode: bool = False,
 ) -> ScanRow:
     return _scan_ticker_impl(
         ticker,
@@ -1677,6 +1862,7 @@ def scan_ticker_cached(
         xai_key=xai_key,
         polygon_key=polygon_key,
         uw_key=uw_key,
+        burry_mode=burry_mode,
     )
 
 
@@ -1806,25 +1992,224 @@ def uw_price_chart_figure_cached(ticker: str, uw_key: str) -> tuple[Optional[go.
     return fig, ""
 
 
-def filtered_to_csv(rows: list[ScanRow]) -> str:
+def filtered_to_csv(rows: list[ScanRow], *, burry_mode: bool = False) -> str:
     buf = io.StringIO()
-    out = []
+    out: list[dict[str, Any]] = []
     for r in rows:
-        out.append(
-            {
-                "Ticker": r.ticker,
-                "MismatchScore": round(r.mismatch_score, 1),
-                "Recommendation": r.recommendation,
-                "ValuationSkew": r.valuation_skew,
-                "FwdPE": r.fwd_pe,
-                "VolReason": r.vol_reason,
-                "LLMFlag": r.llm_flag,
-                "InsiderBonus": r.score_insider_bonus,
-                "OptionIdea": r.option_suggestion,
-            }
-        )
+        rec: dict[str, Any] = {
+            "Ticker": r.ticker,
+            "MismatchScore": round(r.mismatch_score, 1),
+            "Recommendation": r.recommendation,
+            "ValuationSkew": r.valuation_skew,
+            "FwdPE": r.fwd_pe,
+            "VolReason": r.vol_reason,
+            "LLMFlag": r.llm_flag,
+            "InsiderBonus": r.score_insider_bonus,
+            "OptionIdea": r.option_suggestion,
+        }
+        if burry_mode:
+            rec["BurryFit"] = r.burry_fit
+        out.append(rec)
     pd.DataFrame(out).to_csv(buf, index=False)
     return buf.getvalue()
+
+
+# -----------------------------------------------------------------------------
+# Auth (streamlit-authenticator — self-contained in this file)
+# -----------------------------------------------------------------------------
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+AUTH_USERS_JSON = os.path.join(_APP_DIR, "auth_users.json")
+ADMIN_USERNAME = "terb13"
+
+
+def _secrets_get(key: str, default: Any = None) -> Any:
+    try:
+        if hasattr(st, "secrets"):
+            sec = st.secrets
+            if key in sec:
+                return sec[key]
+            if hasattr(sec, "get"):
+                v = sec.get(key)
+                if v is not None:
+                    return v
+    except Exception:
+        pass
+    return default
+
+
+def _to_plain_dict(obj: Any) -> dict[str, Any]:
+    """Streamlit `Secrets` sections are often `Mapping` but not `dict` — normalize for `.get(...)`."""
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, Mapping):
+        try:
+            return dict(obj)
+        except Exception:
+            pass
+    try:
+        if hasattr(obj, "to_dict"):
+            return dict(obj.to_dict())  # type: ignore[call-arg]
+    except Exception:
+        pass
+    try:
+        return {str(k): obj[k] for k in obj}  # type: ignore[operator]
+    except Exception:
+        return {}
+
+
+def _load_file_users_only() -> dict[str, Any]:
+    """Users persisted by admin (auth_users.json) — not the secrets.toml bootstrap users."""
+    if not os.path.isfile(AUTH_USERS_JSON):
+        return {}
+    try:
+        with open(AUTH_USERS_JSON, encoding="utf-8") as f:
+            extra = json.load(f)
+        if isinstance(extra, dict) and isinstance(extra.get("usernames"), dict):
+            return {str(k): dict(v) for k, v in extra["usernames"].items() if isinstance(v, dict)}
+    except Exception:
+        pass
+    return {}
+
+
+def _load_credentials_dict() -> dict[str, Any]:
+    """Merge `[credentials]` from secrets.toml with optional `auth_users.json` (admin-added users)."""
+    raw = _to_plain_dict(_secrets_get("credentials"))
+    creds: dict[str, Any] = {"usernames": {}}
+    un = _to_plain_dict(raw.get("usernames"))
+    for username, udata in un.items():
+        ukey = str(username)
+        row = _to_plain_dict(udata)
+        if row:
+            creds["usernames"][ukey] = {str(k): row[k] for k in row}
+    for u, row in _load_file_users_only().items():
+        creds["usernames"][u] = dict(row)
+    return creds
+
+
+def _save_auth_users_json(usernames: dict[str, Any]) -> Optional[str]:
+    try:
+        with open(AUTH_USERS_JSON, "w", encoding="utf-8") as f:
+            json.dump({"usernames": usernames}, f, indent=2)
+        return None
+    except Exception as e:
+        return str(e)
+
+
+def _auth_logged_in() -> bool:
+    return st.session_state.get("authentication_status") is True
+
+
+def _is_admin() -> bool:
+    if not _auth_logged_in():
+        return False
+    un = str(st.session_state.get("username") or "").strip().lower()
+    return un == ADMIN_USERNAME.lower()
+
+
+def _auth_display_name() -> str:
+    if _auth_logged_in():
+        return str(st.session_state.get("name") or st.session_state.get("username") or "User")
+    return "User"
+
+
+def _build_authenticator() -> tuple[dict[str, Any], Any]:
+    creds = _load_credentials_dict()
+    if not creds.get("usernames"):
+        st.error(
+            "No **`[credentials.usernames.*]`** in secrets. "
+            "Locally: **`.streamlit/secrets.toml`**. "
+            "**Streamlit Community Cloud:** paste the same TOML into **App settings → Secrets**. "
+            f"Include at least **`{ADMIN_USERNAME}`** with a **bcrypt** `password` hash "
+            "(see **`.streamlit/secrets.toml.example`**)."
+        )
+        st.stop()
+    cookie = _to_plain_dict(_secrets_get("cookie"))
+    if not cookie or not (cookie.get("name") and cookie.get("key")):
+        st.error(
+            "Missing or invalid **`[cookie]`** in secrets (local **`.streamlit/secrets.toml`** or **Cloud → Secrets**). "
+            "Add `name`, `key` (≥16 chars), and `expiry_days` under **`[cookie]`** — see **`.streamlit/secrets.toml.example`**."
+        )
+        st.stop()
+    cname = str(cookie.get("name") or "mill_auth_cookie").strip()
+    ckey = str(cookie.get("key") or "").strip()
+    if len(ckey) < 16:
+        st.error("**`cookie.key`** must be a long random string (≥16 characters) in secrets.toml.")
+        st.stop()
+    try:
+        exp = int(cookie.get("expiry_days", 30))
+    except (TypeError, ValueError):
+        exp = 30
+    authenticator = stauth.Authenticate(creds, cname, ckey, exp)
+    return creds, authenticator
+
+
+def render_login_screen(authenticator: Any) -> None:
+    st.markdown('<span class="millenniallity-badge">@millenniallity</span>', unsafe_allow_html=True)
+    st.title("Millenniallity Volatility Mismatch Scanner")
+    st.markdown(
+        "**Private app** — sign in to run the scanner. Air-gapped: no broker integration. "
+        "Data API keys: **`.env`** locally or **Streamlit Cloud → Secrets** as environment-style entries."
+    )
+    st.divider()
+    st.subheader("Login")
+    authenticator.login(location="main")
+
+
+def render_user_management_sidebar() -> None:
+    if not _is_admin():
+        return
+    with st.expander("User Management"):
+        st.caption(
+            "Adds users to **`auth_users.json`** (bcrypt hash). Merges on load. "
+            "**Streamlit Cloud:** the filesystem is often ephemeral — new users may disappear after restart; "
+            "for persistent accounts, add **`[credentials.usernames.*]`** in **Cloud → Secrets** (or commit `auth_users.json` privately)."
+        )
+        with st.form("add_local_user"):
+            nu = st.text_input("Username", key="um_username")
+            ne = st.text_input("Email", key="um_email")
+            np1 = st.text_input("Password", type="password", key="um_pw")
+            np2 = st.text_input("Confirm password", type="password", key="um_pw2")
+            sub = st.form_submit_button("Add user")
+            if sub:
+                u = (nu or "").strip()
+                em = (ne or "").strip()
+                if not u or not np1:
+                    st.error("Username and password are required.")
+                elif len(np1) < 10:
+                    st.error("Password must be at least **10** characters.")
+                elif np1 != np2:
+                    st.error("Passwords do not match.")
+                elif not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", em):
+                    st.error("Enter a valid **email**.")
+                else:
+                    merged = _load_credentials_dict()
+                    if u.lower() in {k.lower() for k in (merged.get("usernames") or {})}:
+                        st.error("That username already exists.")
+                    else:
+                        try:
+                            hp = _hash_password_for_storage(np1)
+                        except Exception as e:
+                            st.error(f"Hash error: {e}")
+                            return
+                        file_users = _load_file_users_only()
+                        file_users[u] = {
+                            "email": em,
+                            "name": u,
+                            "password": hp,
+                        }
+                        err = _save_auth_users_json(file_users)
+                        if err:
+                            st.error(f"Could not save: {err}")
+                        else:
+                            st.success(f"Saved **{u}** — they can sign in with username/password.")
+                            st.rerun()
+
+
+def render_auth_sidebar(authenticator: Any) -> None:
+    st.caption(f"Signed in: **{_auth_display_name()}**")
+    if _auth_logged_in():
+        authenticator.logout("Log out", "sidebar")
+    st.divider()
 
 
 # -----------------------------------------------------------------------------
@@ -1834,19 +2219,11 @@ def main() -> None:
     st.set_page_config(page_title=PAGE_TITLE, layout="wide", page_icon="📊")
     st.markdown(MILLENNIALITY_CSS, unsafe_allow_html=True)
 
-    if auth_required():
-        if not supabase_configured():
-            st.error(
-                "**REQUIRE_LOGIN** is on but Supabase is not configured correctly. In **Supabase → Project Settings → "
-                "API**, copy your real **Project URL** (looks like `https://abcdefgh.supabase.co`) into **`SUPABASE_URL`** "
-                "in `.env` — not the placeholder `your-project.supabase.co`. Paste the **service_role** key into "
-                "**`SUPABASE_SERVICE_ROLE_KEY`**, run **`schema_auth.sql`** in the SQL editor, then restart Streamlit."
-            )
-            st.stop()
-        ensure_bootstrap_admin_from_env()
-        render_auth_gate()
-        logout_control()
-        render_admin_panel()
+    _, authenticator = _build_authenticator()
+
+    if not _auth_logged_in():
+        render_login_screen(authenticator)
+        st.stop()
 
     keys = _env_keys()
     if not keys["fmp"]:
@@ -1856,12 +2233,11 @@ def main() -> None:
         )
 
     with st.sidebar:
-        if supabase_configured() and not auth_required():
-            st.info(
-                "**Sign-in is off.** Add **`REQUIRE_LOGIN=true`** to `.env` and **restart Streamlit** to show login."
-            )
+        render_auth_sidebar(authenticator)
+        render_user_management_sidebar()
         st.caption(
-            "API keys from **`.env`** (FMP optional — Yahoo + SEC + yfinance cover core scanning). Nothing is entered here."
+            "API keys: **`.env`** locally, or top-level keys in **Streamlit Cloud → Secrets** (e.g. `FMP_API_KEY = \"...\"`). "
+            "Nothing is entered in the sidebar."
         )
         st.divider()
         st.caption(
@@ -1875,6 +2251,19 @@ def main() -> None:
         "**Pure discovery:** each run pulls a fresh **liquid** universe from **FMP** (or **Yahoo** if FMP list APIs "
         "are unavailable on your plan) and scores what to **investigate next** — not a watchlist you maintain here. "
         "**Rich** P/E vs peers → **Buy Puts** bias; **cheap** mismatch → calls / stock. Air-gapped for **Public.com**."
+    )
+
+    burry_mode = st.checkbox(
+        "Burry Mode",
+        value=False,
+        help=(
+            "Uses the Top 150 high-beta discovery universe and strengthens short-thesis signals "
+            "(extreme vs blended P/E, insider distribution, Bearish LLM)."
+        ),
+    )
+    st.caption(
+        "**Burry Mode:** Strengthens signals for extreme overvalued shorts and deep value longs per Michael Burry's "
+        "Cassandra Unchained approach."
     )
 
     run = st.button("🚀 Run Auto Scanner — Find Volatile P/E Mismatches", type="primary", use_container_width=True)
@@ -1897,7 +2286,13 @@ def main() -> None:
     if not xai_key:
         st.warning("**XAI_API_KEY** missing — narrative scoring disabled until set in `.env`.")
 
-    wide, universe_source = build_discovery_universe(fmp_key, VOLATILE_UNIVERSE_LIMIT)
+    if burry_mode:
+        st.success(
+            f"**Burry Mode on** — scanning **Top {BURRY_UNIVERSE_LIMIT}** high-beta discovery names (no manual ticker list)."
+        )
+
+    uni_limit = BURRY_UNIVERSE_LIMIT if burry_mode else VOLATILE_UNIVERSE_LIMIT
+    wide, universe_source = build_discovery_universe(fmp_key, uni_limit)
     if not wide:
         st.error(
             "**No discovery symbols.** FMP **stable company-screener** is often **402** (paid) on lower tiers; "
@@ -1938,6 +2333,7 @@ def main() -> None:
                     xai_key,
                     polygon_key,
                     uw_key,
+                    burry_mode=burry_mode,
                 )
             )
         except Exception as e:
@@ -1957,6 +2353,7 @@ def main() -> None:
                     llm_summary=f"Fatal error: {e}",
                     mismatch_score=0.0,
                     recommendation="Skip",
+                    burry_fit="",
                     errors=[str(e)],
                 )
             )
@@ -1965,10 +2362,11 @@ def main() -> None:
 
     actionable_pool = [r for r in results if is_actionable_recommendation(r)]
     filtered = [r for r in actionable_pool if r.mismatch_score >= MIN_DISPLAY_SCORE]
-    filtered.sort(key=lambda r: r.mismatch_score, reverse=True)
+    filtered.sort(key=lambda r: _burry_results_sort_key(r, burry_mode))
 
-    summary_records = [
-        {
+    summary_records = []
+    for r in filtered:
+        rec = {
             "Ticker": r.ticker,
             "Mismatch Score": round(r.mismatch_score, 1),
             "Recommendation": r.recommendation,
@@ -1977,13 +2375,10 @@ def main() -> None:
             "Vol Reason": r.vol_reason,
             "LLM Flag": r.llm_flag,
         }
-        for r in filtered
-    ]
-    sum_df = (
-        pd.DataFrame(summary_records).sort_values("Mismatch Score", ascending=False)
-        if summary_records
-        else pd.DataFrame()
-    )
+        if burry_mode:
+            rec["Burry Fit"] = r.burry_fit
+        summary_records.append(rec)
+    sum_df = pd.DataFrame(summary_records) if summary_records else pd.DataFrame()
 
     st.subheader("Results overview (actionable only)")
     if sum_df.empty:
@@ -1993,7 +2388,7 @@ def main() -> None:
 
     st.download_button(
         label="Download CSV (actionable & score-filtered)",
-        data=filtered_to_csv(filtered),
+        data=filtered_to_csv(filtered, burry_mode=burry_mode),
         file_name=f"millenniallity_scan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
         mime="text/csv",
     )
@@ -2018,10 +2413,22 @@ def main() -> None:
 
     for r in filtered:
         title = f"{r.ticker} · {r.mismatch_score:.0f} · {r.recommendation}"
+        if burry_mode and r.recommendation == "Burry Put Candidate":
+            title = "🎯 " + title
         auto_expand = r.mismatch_score >= HIGH_SCORE_EXPAND_THRESHOLD or (
             r.score_insider_bonus > 0 and r.pe_mismatch_30
         )
+        if burry_mode and r.recommendation == "Burry Put Candidate":
+            auto_expand = True
         with st.expander(title, expanded=auto_expand):
+            if burry_mode and r.burry_fit and r.burry_fit.strip() not in ("", "—"):
+                st.markdown(f"**Burry Fit:** {r.burry_fit}")
+            if burry_mode and r.recommendation == "Burry Put Candidate":
+                st.warning(
+                    "**Burry Put Candidate** — classic setup: **very rich** forward P/E vs blended peer/sector bench "
+                    "(e.g. **Carvana ~46×** vs **~18–20×** peer context) **plus** insider distribution / owner cash-out "
+                    "and a **Bearish** narrative flag."
+                )
             c1, c2 = st.columns([1, 1])
             with c1:
                 fig = pe_bar_figure(r)
