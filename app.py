@@ -1190,7 +1190,7 @@ def burry_large_insider_extraction(
     insider_sell_shares: float,
     insider_net_shares: float,
 ) -> bool:
-    """Heuristic for owner / insider cash-out scale (large sells vs buys)."""
+    """Heuristic for owner / insider cash-out scale (large sells vs buys). Inputs are **notional $** from UW insider-buy-sells."""
     if not insider_net_seller:
         return False
     if insider_sell_shares >= max(insider_buy_shares * 2.5, 1.0) and insider_sell_shares >= 50_000.0:
@@ -1267,6 +1267,7 @@ class ScanRow:
     llm_provider: str = ""
     narrative_contradiction: str = "Unclear"
     unusual_whales_note: str = ""
+    insider_uw_raw_debug: str = ""
     peer_median_pe: Optional[float] = None
     sector_benchmark_pe: Optional[float] = None
     fwd_pe_source: str = ""
@@ -1477,89 +1478,198 @@ def sector_for_ticker(ticker: str, extra_sector_map: dict[str, str]) -> str:
 # -----------------------------------------------------------------------------
 @dataclass
 class InsiderFlowSummary:
+    """Aggregated insider flow. `net_shares` / buy / sell store **notional dollars** for scoring thresholds."""
+
     net_shares: float
     buy_shares: float
     sell_shares: float
     n_transactions: int
     summary_line: str
     net_buyer: bool
+    raw_debug: str = ""
+    txn_purchases: int = 0
+    txn_sells: int = 0
 
 
-def _signed_insider_shares(row: dict) -> float:
-    raw = row.get("transaction_shares") or row.get("shares") or row.get("share") or 0
+def _uw_parse_notional(val: Any) -> float:
+    if val is None:
+        return 0.0
     try:
-        sh = float(raw)
+        return float(str(val).replace(",", "").strip())
     except (TypeError, ValueError):
         return 0.0
-    t = str(
-        row.get("transaction_type")
-        or row.get("type")
-        or row.get("acquisition_or_disposition")
-        or row.get("acquisitionOrDisposition")
-        or ""
-    ).lower()
-    if any(x in t for x in ("sale", "sell", "disposition", "dispose", "d ")) and "purchase" not in t:
-        return -abs(sh)
-    if any(x in t for x in ("purchase", "buy", "acquisition", "gift", "award", "grant", "a ")):
-        return abs(sh)
-    code = str(row.get("transaction_code") or row.get("code") or "").upper()
-    if code == "S":
-        return -abs(sh)
-    if code in ("P", "A", "M", "G", "F"):
-        return abs(sh)
-    return 0.0
 
 
-def _net_insider_amount(row: dict) -> float:
-    amt = row.get("amount")
-    if amt is not None:
-        try:
-            return float(amt)
-        except (TypeError, ValueError):
-            pass
-    return _signed_insider_shares(row)
+def _uw_truncate_debug(text: str, max_len: int = 2000) -> str:
+    t = text.strip()
+    if len(t) <= max_len:
+        return t
+    return t[: max_len - 3] + "..."
 
 
 def fetch_unusual_insider_4q(ticker: str, uw_key: str) -> InsiderFlowSummary:
+    """
+    GET /api/stock/{ticker}/insider-buy-sells — aggregate filing rows (purchases, sells, notionals).
+    See Unusual Whales OpenAPI: Insider statistics (per filing_date rows in `data`).
+    """
+    sym = ticker.upper().strip()
     if not uw_key:
-        return InsiderFlowSummary(0.0, 0.0, 0.0, 0, "Unusual Whales: no API key in environment.", False)
-    start = (datetime.now() - timedelta(days=int(365 * 1.1))).strftime("%Y-%m-%d")
-    url = "https://api.unusualwhales.com/api/insider/transactions"
-    params = {"ticker_symbol": ticker.upper(), "start_date": start, "limit": 500}
+        return InsiderFlowSummary(
+            0.0,
+            0.0,
+            0.0,
+            0,
+            "Unusual Whales: no API key in environment.",
+            False,
+            raw_debug="(no request sent)",
+        )
+    url = f"https://api.unusualwhales.com/api/stock/{urllib.parse.quote(sym, safe='')}/insider-buy-sells"
     headers = {"Authorization": f"Bearer {uw_key}", "Accept": "application/json"}
+    raw_debug = ""
     try:
-        r = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+        r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         if r.status_code == 401:
-            return InsiderFlowSummary(0.0, 0.0, 0.0, 0, "Unusual Whales: 401 unauthorized.", False)
-        r.raise_for_status()
+            return InsiderFlowSummary(
+                0.0,
+                0.0,
+                0.0,
+                0,
+                "Unusual Whales: **401** unauthorized — check **UNUSUAL_WHALES_API_KEY**.",
+                False,
+                raw_debug=_uw_truncate_debug(r.text or "(empty body)"),
+            )
+        if r.status_code == 404:
+            return InsiderFlowSummary(
+                0.0,
+                0.0,
+                0.0,
+                0,
+                f"Unusual Whales: **404** for `{sym}` (no insider buy/sell data).",
+                False,
+                raw_debug=_uw_truncate_debug(r.text or "(empty)"),
+            )
+        if r.status_code >= 400:
+            raw_debug = _uw_truncate_debug(r.text or str(r.status_code))
+            return InsiderFlowSummary(
+                0.0,
+                0.0,
+                0.0,
+                0,
+                f"Unusual Whales: HTTP **{r.status_code}** — insider endpoint error.",
+                False,
+                raw_debug=raw_debug,
+            )
         body = r.json()
+    except json.JSONDecodeError as e:
+        txt = (r.text or "") if r is not None else ""
+        return InsiderFlowSummary(
+            0.0,
+            0.0,
+            0.0,
+            0,
+            f"Unusual Whales: invalid JSON — {e}",
+            False,
+            raw_debug=_uw_truncate_debug(txt),
+        )
     except Exception as e:
-        return InsiderFlowSummary(0.0, 0.0, 0.0, 0, f"Unusual Whales error: {e}", False)
+        return InsiderFlowSummary(
+            0.0,
+            0.0,
+            0.0,
+            0,
+            f"Unusual Whales error: {e}",
+            False,
+            raw_debug="(exception — no response body)",
+        )
 
-    rows: list = body if isinstance(body, list) else (body.get("data") or body.get("transactions") or [])
-    buy = sell = 0.0
-    net = 0.0
-    symu = ticker.upper()
+    rows: list = []
+    if isinstance(body, dict):
+        raw = body.get("data") or body.get("results")
+        rows = raw if isinstance(raw, list) else []
+    elif isinstance(body, list):
+        rows = body
+
+    if not isinstance(rows, list):
+        raw_debug = _uw_truncate_debug(json.dumps(body, default=str))
+        return InsiderFlowSummary(
+            0.0,
+            0.0,
+            0.0,
+            0,
+            "Unusual Whales: unexpected response shape (no `data` list).",
+            False,
+            raw_debug=raw_debug,
+        )
+
+    buy_notional = 0.0
+    sell_notional_mag = 0.0
+    net_notional = 0.0
+    txn_p = txn_s = 0
+    filing_rows = 0
+
     for item in rows:
         if not isinstance(item, dict):
             continue
-        it = str(item.get("ticker") or "").upper()
-        if it and it != symu:
-            continue
-        signed = _net_insider_amount(item)
-        net += signed
-        if signed >= 0:
-            buy += abs(signed)
-        else:
-            sell += abs(signed)
+        filing_rows += 1
+        try:
+            pcount = int(float(item.get("purchases") or 0))
+        except (TypeError, ValueError):
+            pcount = 0
+        try:
+            scount = int(float(item.get("sells") or 0))
+        except (TypeError, ValueError):
+            scount = 0
+        txn_p += pcount
+        txn_s += scount
+        pn = _uw_parse_notional(item.get("purchases_notional"))
+        sn = _uw_parse_notional(item.get("sells_notional"))
+        buy_notional += pn
+        sell_notional_mag += abs(sn)
+        net_notional += pn + sn
 
-    n = len(rows)
-    nb = net > 0
+    n_txn_counts = txn_p + txn_s
+    net_txn = txn_p - txn_s
+    nb = net_notional > 0
+
+    if filing_rows == 0:
+        raw_debug = _uw_truncate_debug(json.dumps(body, default=str))
+        line = (
+            "**No insider filing rows** returned for this ticker (empty `data`). "
+            "Unusual Whales may have no recent Form 4 aggregation for this name."
+        )
+        return InsiderFlowSummary(
+            0.0,
+            0.0,
+            0.0,
+            0,
+            line,
+            False,
+            raw_debug=raw_debug,
+        )
+
+    limited = filing_rows < 3
+    lim_note = " _Data may be limited (few filing days returned)._ " if limited else ""
+
     line = (
-        f"~400d insider: net **{net:,.0f}** (buys {buy:,.0f} / sells {sell:,.0f}), n={n} — "
-        f"**{'net buyer' if nb else 'net seller / flat'}**."
+        f"Insider flow (UW `insider-buy-sells`): **net ${net_notional:,.0f}** notional "
+        f"(buys **${buy_notional:,.0f}** / sells **${sell_notional_mag:,.0f}**). "
+        f"**Txn counts:** purchases **{txn_p:,}** · sells **{txn_s:,}** · "
+        f"net **{net_txn:+,}** (purchases − sells). **Filing rows:** {filing_rows}. "
+        f"{lim_note}"
+        f"**{'Net buyer' if nb else 'Net seller / flat'}** by $."
     )
-    return InsiderFlowSummary(net, buy, sell, n, line, nb)
+
+    return InsiderFlowSummary(
+        net_notional,
+        buy_notional,
+        sell_notional_mag,
+        n_txn_counts,
+        line,
+        nb,
+        raw_debug="",
+        txn_purchases=txn_p,
+        txn_sells=txn_s,
+    )
 
 
 def _parse_uw_iso_time(s: Any) -> Optional[datetime]:
@@ -1778,6 +1888,7 @@ def _scan_ticker_impl(
 
     ins = fetch_unusual_insider_4q(t, uw_key)
     row.unusual_whales_note = ins.summary_line
+    row.insider_uw_raw_debug = ins.raw_debug
     row.insider_net_shares = ins.net_shares
     row.insider_buy_shares = ins.buy_shares
     row.insider_sell_shares = ins.sell_shares
@@ -2561,8 +2672,12 @@ def main() -> None:
                 st.markdown("**Unusual Whales**")
                 st.markdown(r.unusual_whales_note or "—")
                 st.caption(
-                    f"Flow: net {r.insider_net_shares:,.0f} · buys {r.insider_buy_shares:,.0f} · sells {r.insider_sell_shares:,.0f}"
+                    f"Notional ($): net **{r.insider_net_shares:,.0f}** · buys **{r.insider_buy_shares:,.0f}** · "
+                    f"sells **{r.insider_sell_shares:,.0f}** (txn counts & filing rows in note above)."
                 )
+                if r.insider_uw_raw_debug:
+                    st.caption("UW raw response (debug):")
+                    st.code(_uw_truncate_debug(r.insider_uw_raw_debug, 1200), language=None)
             if r.errors:
                 st.error("Notes: " + "; ".join(r.errors))
             render_grok_followup_chat(r.ticker, r, xai_key)
