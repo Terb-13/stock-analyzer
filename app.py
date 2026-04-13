@@ -130,6 +130,29 @@ MIN_DISPLAY_SCORE = 45
 VOLATILE_UNIVERSE_LIMIT = 120
 BURRY_UNIVERSE_LIMIT = 150
 
+# When FMP stock-screener / list APIs return 0 symbols (common 402/403 on free/starter tiers), use this list.
+FALLBACK_VOLATILE_TICKERS: list[str] = [
+    "CVNA",
+    "RIVN",
+    "SMCI",
+    "MU",
+    "TTD",
+    "UAA",
+    "CNQ",
+    "ZIM",
+    "PLTR",
+    "GME",
+    "KTOS",
+    "CNXC",
+    "DAL",
+    "APTV",
+    "MGA",
+    "BWA",
+]
+
+# User-Agent for Yahoo Finance HTTP calls (e.g. peer recommendations API).
+YAHOO_SCREENER_UA = "Mozilla/5.0 (compatible; MillenniallityScanner/1.0; +https://github.com)"
+
 REQUEST_TIMEOUT = 25
 
 # Loaded once per process from sec.gov (ticker → zero-padded 10-digit CIK)
@@ -1059,60 +1082,12 @@ def fmp_high_beta_universe(api_key: str, limit: int = 100) -> tuple[list[str], s
     return [], "none", "\n".join(debug_lines) if debug_lines else "FMP: no HTTP lines recorded."
 
 
-YAHOO_PREDEFINED_SCREENER_IDS = ("most_actives", "day_gainers", "day_losers")
-YAHOO_SCREENER_UA = "Mozilla/5.0 (compatible; MillenniallityScanner/1.0; +https://github.com)"
-
-
-def _safe_get_json_with_headers(url: str, headers: dict[str, str]) -> tuple[Any, Optional[str]]:
-    try:
-        r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        return r.json(), None
-    except Exception as e:
-        return None, str(e)
-
-
-def yahoo_screener_universe(limit: int) -> tuple[list[str], str]:
-    """Liquid movers from Yahoo predefined screeners (no API key). Used when FMP list endpoints fail."""
-    if limit <= 0:
-        return [], "yahoo/none"
-    headers = {"User-Agent": YAHOO_SCREENER_UA}
-    per_call = max(25, min(limit, 100))
-    seen: list[str] = []
-    used: list[str] = []
-    for scr_id in YAHOO_PREDEFINED_SCREENER_IDS:
-        url = (
-            "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
-            f"?count={per_call}&scrIds={scr_id}&formatted=false"
-        )
-        data, err = _safe_get_json_with_headers(url, headers)
-        if err or not data:
-            continue
-        fin = data.get("finance") if isinstance(data, dict) else None
-        result = (fin or {}).get("result") or []
-        if not result:
-            continue
-        quotes = result[0].get("quotes") or []
-        if quotes:
-            used.append(scr_id)
-        for q in quotes:
-            if not isinstance(q, dict):
-                continue
-            sym = q.get("symbol")
-            if sym and str(sym).strip():
-                u = str(sym).strip().upper()
-                if u not in seen:
-                    seen.append(u)
-            if len(seen) >= limit:
-                return seen[:limit], "yahoo/" + "+".join(used) if used else "yahoo/empty"
-    return seen[:limit], "yahoo/" + "+".join(used) if used else "yahoo/none"
-
-
 def build_discovery_universe(
     fmp_api_key: str, limit: int,
 ) -> tuple[list[str], str, str, bool, int]:
     """
-    FMP volatile universe first; if empty (402/403 paywalls), Yahoo predefined screeners.
+    FMP volatile universe first. If **fmp_high_beta_universe** returns **0** symbols (typical on free/starter
+    tiers: 402/403), use **FALLBACK_VOLATILE_TICKERS** immediately — curated high-volatility names, no empty scan.
 
     Returns `(symbols, source_label, fmp_debug_text, fmp_returned_any_symbols, fmp_symbol_count)`.
     """
@@ -1121,22 +1096,22 @@ def build_discovery_universe(
     fmp_ok = fmp_n > 0
     if syms:
         return syms, src, fmp_dbg, fmp_ok, fmp_n
-    y_syms, y_src = yahoo_screener_universe(limit)
-    if y_syms:
+    cap = max(0, min(limit, len(FALLBACK_VOLATILE_TICKERS)))
+    if cap == 0:
         return (
-            y_syms,
-            y_src,
-            fmp_dbg + "\nUniverse fallback: Yahoo predefined screeners (FMP list empty).",
+            [],
+            "none",
+            fmp_dbg + "\nFMP returned 0 symbols; fallback list skipped (limit=0).",
             fmp_ok,
             fmp_n,
         )
-    return (
-        [],
-        "none",
-        fmp_dbg + "\nUniverse fallback: Yahoo also returned no symbols.",
-        fmp_ok,
-        fmp_n,
+    fb = [t.upper().strip() for t in FALLBACK_VOLATILE_TICKERS[:cap]]
+    n_fb = len(fb)
+    extra = (
+        f"\nFMP screener returned 0 symbols → using fallback list of {n_fb} volatile tickers "
+        f"(curated high-volatility names; FMP list endpoints often empty on starter tiers)."
     )
+    return fb, "fallback/high-volatility-curated", fmp_dbg + extra, fmp_ok, fmp_n
 
 
 # -----------------------------------------------------------------------------
@@ -2296,8 +2271,8 @@ def main() -> None:
     keys = _env_keys()
     if not keys["fmp"]:
         st.warning(
-            "**FMP_API_KEY** is missing — discovery uses **Yahoo** screeners only; P/E uses **yfinance** + SEC fallbacks. "
-            "Add FMP back if your quota returns."
+            "**FMP_API_KEY** is missing — `fmp_high_beta_universe` returns empty; discovery uses the **curated volatile "
+            "fallback**; P/E uses **yfinance** + SEC fallbacks. Add FMP for screener lists, peers, and ratios where your plan allows."
         )
 
     with st.sidebar:
@@ -2316,8 +2291,9 @@ def main() -> None:
     st.markdown('<span class="millenniallity-badge">@millenniallity</span>', unsafe_allow_html=True)
     st.title("Millenniallity Volatility Mismatch Scanner")
     st.markdown(
-        "**Pure discovery:** each run pulls a fresh **liquid** universe from **FMP** (or **Yahoo** if FMP list APIs "
-        "are unavailable on your plan) and scores what to **investigate next** — not a watchlist you maintain here. "
+        "**Pure discovery:** each run pulls a fresh **liquid** universe from **FMP**; if FMP list APIs return "
+        "**0** symbols (common on starter tiers), a **curated volatile fallback** list is used automatically. "
+        "Scores what to **investigate next** — not a watchlist you maintain here. "
         "**Rich** P/E vs peers → **Buy Puts** bias; **cheap** mismatch → calls / stock. Air-gapped for **Public.com**."
     )
 
@@ -2365,25 +2341,20 @@ def main() -> None:
     )
     if not wide:
         st.error(
-            "**No discovery symbols.** FMP **stable company-screener** is often **402** (paid) on lower tiers; "
-            "**v3** actives/gainers can return **403** (“Legacy Endpoint”) for keys issued after Aug 2025 — so the "
-            "symbol list can be empty even with a working key. We also tried **Yahoo Finance** predefined screeners "
-            "(check network if still empty). Per-ticker FMP routes like **stable/ratios** may still work; upgrade "
-            "FMP or use a grandfathered key for full list APIs. "
-            "[Pricing](https://site.financialmodelingprep.com/developer/docs/pricing)"
+            "**No discovery symbols.** FMP returned **0** and the **fallback list** could not be applied "
+            "(e.g. invalid limit). Normally, when FMP list endpoints are empty, the curated fallback runs automatically."
         )
         st.stop()
-    if universe_source.startswith("yahoo"):
-        st.info(
-            f"**Universe source:** `{universe_source}` — FMP did not return a symbol list (screener paywall or "
-            "legacy list block). Using **Yahoo** liquid movers for discovery; **FMP** still powers ratios, peers, "
-            "and filings where your key allows."
-        )
-    elif "stock_market" in universe_source:
+    if "stock_market" in universe_source:
         st.info(
             f"**Universe source:** `{universe_source}` — company **screener** returned no rows for your key/filters; "
             "using **high-liquidity movers** instead (still fine for discovery). "
             "For strict high-beta lists, check your FMP plan or API playground."
+        )
+    elif universe_source.startswith("fallback"):
+        st.info(
+            "**FMP screener returned 0 symbols** → using **fallback list** of curated volatile tickers "
+            f"(`{universe_source}`). Per-ticker ratios/peers still use FMP where your key allows."
         )
     universe = sorted(set(wide))
     n_universe = len(universe)
@@ -2468,6 +2439,10 @@ def main() -> None:
             "Final counts for this run (live counters above were cleared). "
             "See **Debug / Errors** for FMP traces and per-ticker notes."
         )
+        if universe_source.startswith("fallback"):
+            st.info(
+                f"**FMP screener returned 0 symbols** → using **fallback list of {n_universe}** volatile tickers."
+            )
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Total tickers scanned", total_scanned)
         m2.metric("Passed volatility filter", n_vol_pass)
@@ -2594,9 +2569,14 @@ def main() -> None:
 
     with st.expander("Debug / Errors", expanded=(n_final == 0)):
         st.markdown("**Discovery: `fmp_high_beta_universe`**")
+        if universe_source.startswith("fallback"):
+            st.warning(
+                f"**FMP screener returned 0 symbols** → using **fallback list of {n_universe}** volatile tickers "
+                f"(`{universe_source}`)."
+            )
         st.markdown(
             f"- **Returned any symbols:** **{'Yes' if fmp_universe_had_symbols else 'No'}** "
-            f"(count from FMP before Yahoo fallback: **{fmp_universe_n}**)\n"
+            f"(count from FMP before fallback: **{fmp_universe_n}**)\n"
             f"- **Universe source used for scan:** `{universe_source}` · **unique tickers scanned:** {total_scanned}"
         )
         st.markdown("**FMP HTTP trace (high-beta / movers attempts)**")
