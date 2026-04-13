@@ -11,7 +11,7 @@ import os
 import re
 import statistics
 import urllib.parse
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
@@ -127,11 +127,30 @@ FMP_BASE = "https://financialmodelingprep.com"
 SCAN_CACHE_TTL_SEC = 3600
 HIGH_SCORE_EXPAND_THRESHOLD = 65
 MIN_DISPLAY_SCORE = 45
-VOLATILE_UNIVERSE_LIMIT = 120
-BURRY_UNIVERSE_LIMIT = 150
 
-# When FMP stock-screener / list APIs return 0 symbols (common 402/403 on free/starter tiers), use this list.
-FALLBACK_VOLATILE_TICKERS: list[str] = [
+# --- User-selectable scan universes (see `UNIVERSE_CHOICES` + `assemble_scan_universe`) ---
+HIGH_VOL_FMP_LIMIT = 300
+HIGH_VOL_BETA_MIN = 1.35
+
+UNIVERSE_CHOICES_ORDER: list[str] = [
+    "high_vol",
+    "core_watchlist",
+    "burry_focus",
+    "auto_ev",
+    "ai_tech",
+    "energy_shipping",
+]
+
+UNIVERSE_CHOICES: dict[str, str] = {
+    "high_vol": "High-Vol Discovery (FMP Premium screener, limit=300, β>1.35)",
+    "core_watchlist": "My Core Watchlist (CVNA, RIVN, SMCI, MU, …)",
+    "burry_focus": "Burry Mode Focus (overvalued + insider-selling bias names)",
+    "auto_ev": "Auto / EV Sector",
+    "ai_tech": "AI / Tech Volatility",
+    "energy_shipping": "Energy / Shipping",
+}
+
+CORE_WATCHLIST_TICKERS: list[str] = [
     "CVNA",
     "RIVN",
     "SMCI",
@@ -143,12 +162,73 @@ FALLBACK_VOLATILE_TICKERS: list[str] = [
     "PLTR",
     "GME",
     "KTOS",
-    "CNXC",
-    "DAL",
+    "PACS",
+    "TWLO",
     "APTV",
     "MGA",
     "BWA",
+    "DAL",
 ]
+
+BURRY_FOCUS_TICKERS: list[str] = [
+    "CVNA",
+    "GME",
+    "AMC",
+    "PLTR",
+    "SMCI",
+    "COIN",
+    "HOOD",
+    "MSTR",
+    "RIVN",
+    "CAR",
+]
+
+AUTO_EV_TICKERS: list[str] = [
+    "TSLA",
+    "RIVN",
+    "LCID",
+    "CVNA",
+    "F",
+    "GM",
+    "STLA",
+    "NIO",
+    "XPEV",
+    "LI",
+]
+
+AI_TECH_TICKERS: list[str] = [
+    "SMCI",
+    "MU",
+    "TTD",
+    "NVDA",
+    "AMD",
+    "AVGO",
+    "PANW",
+    "CRWD",
+    "NET",
+]
+
+ENERGY_SHIPPING_TICKERS: list[str] = [
+    "CNQ",
+    "ZIM",
+    "MATX",
+    "DAC",
+    "GSL",
+    "XOM",
+    "CVX",
+    "EOG",
+]
+
+
+def _dedupe_tickers_preserve_order(tickers: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in tickers:
+        u = str(t).upper().strip()
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 # User-Agent for Yahoo Finance HTTP calls (e.g. peer recommendations API).
 YAHOO_SCREENER_UA = "Mozilla/5.0 (compatible; MillenniallityScanner/1.0; +https://github.com)"
@@ -973,145 +1053,120 @@ def _fmp_response_to_symbols(data: Any) -> list[str]:
     return out
 
 
-def fmp_high_beta_universe(api_key: str, limit: int = 100) -> tuple[list[str], str, str]:
-    """
-    Build a volatile discovery list: try **stable company-screener**, then legacy **v3 stock-screener**,
-    then **most actives / gainers** (usually allowed on free tier if screener is paywalled or params reject).
+def _fmp_err_snip(text: str, max_len: int = 220) -> str:
+    t = (text or "").strip().replace("\n", " ")
+    if len(t) <= max_len:
+        return t
+    return t[: max_len - 3] + "..."
 
-    Returns `(symbols, source_label, fmp_debug_text)` — the third string logs HTTP status for each FMP
-    attempt (for the Debug panel when the universe is empty or misbehaving).
+
+def fmp_high_vol_discovery_universe(
+    api_key: str,
+    *,
+    limit: int = HIGH_VOL_FMP_LIMIT,
+    beta_min: float = HIGH_VOL_BETA_MIN,
+) -> tuple[list[str], str, str, int]:
+    """
+    High-vol discovery: **v3/stock-screener** first, then **stable/company-screener** with Premium-friendly filters.
+
+    Returns `(symbols, source_label, debug_text, fmp_parsed_symbol_count)`.
     """
     debug_lines: list[str] = []
     if not api_key:
-        return [], "none", "FMP: no API key — skipped high-beta universe calls."
+        return [], "none", "FMP: no API key — skipped High-Vol screener calls.", 0
 
-    attempts: list[tuple[str, dict[str, str]]] = [
-        (
-            f"{FMP_BASE}/stable/company-screener",
-            {
-                "apikey": api_key,
-                "limit": str(limit),
-                "isActivelyTrading": "true",
-                "isEtf": "false",
-                "betaMoreThan": "1.25",
-                "volumeMoreThan": "100000",
-                "marketCapMoreThan": "10000000",
-            },
-        ),
-        (
-            f"{FMP_BASE}/stable/company-screener",
-            {
-                "apikey": api_key,
-                "limit": str(limit),
-                "isActivelyTrading": "true",
-                "betaMoreThan": "1.15",
-                "marketCapMoreThan": "5000000",
-            },
-        ),
-        (
-            f"{FMP_BASE}/stable/company-screener",
-            {
-                "apikey": api_key,
-                "limit": str(limit),
-                "isActivelyTrading": "true",
-                "marketCapMoreThan": "30000000",
-                "betaMoreThan": "1.1",
-            },
-        ),
-        (
-            f"{FMP_BASE}/api/v3/stock-screener",
-            {
-                "apikey": api_key,
-                "limit": str(limit),
-                "isActivelyTrading": "true",
-                "isEtf": "false",
-                "betaMoreThan": "1.25",
-                "volumeMoreThan": "100000",
-                "marketCapMoreThan": "10000000",
-            },
-        ),
-        (
-            f"{FMP_BASE}/api/v3/stock-screener",
-            {
-                "apikey": api_key,
-                "limit": str(limit),
-                "marketCapMoreThan": "1000000",
-                "betaMoreThan": "1.05",
-            },
-        ),
+    lim = min(int(limit), HIGH_VOL_FMP_LIMIT)
+    common: dict[str, str] = {
+        "apikey": api_key,
+        "limit": str(lim),
+        "isActivelyTrading": "true",
+        "isEtf": "false",
+        "betaMoreThan": str(beta_min),
+        "volumeMoreThan": "500000",
+        "marketCapMoreThan": "300000000",
+    }
+
+    attempts: list[tuple[str, str]] = [
+        ("v3/stock-screener (High-Vol)", f"{FMP_BASE}/api/v3/stock-screener"),
+        ("stable/company-screener (High-Vol)", f"{FMP_BASE}/stable/company-screener"),
     ]
 
-    primary_logged = False
-    for base, params in attempts:
-        url = f"{base}?{urllib.parse.urlencode(params)}"
-        short = "stable/company-screener" if "stable" in base else "v3/stock-screener"
+    for label, base in attempts:
+        url = f"{base}?{urllib.parse.urlencode(common)}"
         try:
             r = requests.get(url, timeout=REQUEST_TIMEOUT)
-            if not primary_logged and "stable" in base and "betaMoreThan" in params:
+            if r.status_code != 200:
+                snip = _fmp_err_snip(r.text or "")
                 debug_lines.append(
-                    f"Primary high-beta universe call ({short}, strict filters): HTTP {r.status_code}"
+                    f"{label}: HTTP {r.status_code} — parsed symbols: 0 — error snippet: {snip or '(empty body)'}"
                 )
-                primary_logged = True
-            if r.status_code != 200:
-                debug_lines.append(f"{short}: HTTP {r.status_code}")
                 continue
             data = r.json()
         except Exception as e:
-            debug_lines.append(f"{short}: {e}")
+            debug_lines.append(f"{label}: request failed — parsed symbols: 0 — error: {e}")
             continue
         syms = _fmp_response_to_symbols(data)
+        n_sym = len(syms)
+        debug_lines.append(f"{label}: HTTP 200 — parsed symbols: {n_sym}")
         if syms:
-            label = "stable/company-screener" if "stable" in base else "v3/stock-screener"
-            return syms[:limit], label, "\n".join(debug_lines)
+            src = "fmp/v3-high-vol" if "v3" in base else "fmp/stable-high-vol"
+            return syms[:lim], src, "\n".join(debug_lines), n_sym
 
-    for tail in ("stock_market/actives", "stock_market/gainers", "stock_market/losers"):
-        url = f"{FMP_BASE}/api/v3/{tail}?apikey={api_key}"
-        try:
-            r = requests.get(url, timeout=REQUEST_TIMEOUT)
-            debug_lines.append(f"v3/{tail}: HTTP {r.status_code}")
-            if r.status_code != 200:
-                continue
-            data = r.json()
-        except Exception as e:
-            debug_lines.append(f"v3/{tail}: {e}")
-            continue
-        syms = _fmp_response_to_symbols(data)
-        if syms:
-            return syms[:limit], f"v3/{tail}", "\n".join(debug_lines)
-
-    return [], "none", "\n".join(debug_lines) if debug_lines else "FMP: no HTTP lines recorded."
+    return [], "none", "\n".join(debug_lines) if debug_lines else "FMP High-Vol: no attempts logged.", 0
 
 
-def build_discovery_universe(
-    fmp_api_key: str, limit: int,
-) -> tuple[list[str], str, str, bool, int]:
+def assemble_scan_universe(
+    selected_keys: list[str],
+    fmp_api_key: str,
+) -> tuple[list[str], str, str, bool, int, str]:
     """
-    FMP volatile universe first. If **fmp_high_beta_universe** returns **0** symbols (typical on free/starter
-    tiers: 402/403), use **FALLBACK_VOLATILE_TICKERS** immediately — curated high-volatility names, no empty scan.
+    Merge one or more scan universes (FMP + hardcoded lists), dedupe, preserve first-seen order.
 
-    Returns `(symbols, source_label, fmp_debug_text, fmp_returned_any_symbols, fmp_symbol_count)`.
+    Returns `(symbols, universe_source_tag, fmp_debug_text, fmp_had_symbols, fmp_total_parsed_count, scan_summary_line)`.
     """
-    syms, src, fmp_dbg = fmp_high_beta_universe(fmp_api_key, limit)
-    fmp_n = len(syms)
-    fmp_ok = fmp_n > 0
-    if syms:
-        return syms, src, fmp_dbg, fmp_ok, fmp_n
-    cap = max(0, min(limit, len(FALLBACK_VOLATILE_TICKERS)))
-    if cap == 0:
-        return (
-            [],
-            "none",
-            fmp_dbg + "\nFMP returned 0 symbols; fallback list skipped (limit=0).",
-            fmp_ok,
-            fmp_n,
-        )
-    fb = [t.upper().strip() for t in FALLBACK_VOLATILE_TICKERS[:cap]]
-    n_fb = len(fb)
-    extra = (
-        f"\nFMP screener returned 0 symbols → using fallback list of {n_fb} volatile tickers "
-        f"(curated high-volatility names; FMP list endpoints often empty on starter tiers)."
-    )
-    return fb, "fallback/high-volatility-curated", fmp_dbg + extra, fmp_ok, fmp_n
+    if not selected_keys:
+        return [], "none", "No scan universes selected.", False, 0, ""
+
+    debug_parts: list[str] = []
+    merged: list[str] = []
+    fmp_total_parsed = 0
+    fmp_had_any = False
+    labels_short: list[str] = []
+
+    for key in selected_keys:
+        if key == "high_vol":
+            labels_short.append("High-Vol Discovery")
+            part, _src, dbg, n_parsed = fmp_high_vol_discovery_universe(
+                fmp_api_key, limit=HIGH_VOL_FMP_LIMIT, beta_min=HIGH_VOL_BETA_MIN
+            )
+            fmp_total_parsed += n_parsed
+            if n_parsed > 0:
+                fmp_had_any = True
+            debug_parts.append("=== High-Vol Discovery (FMP) ===\n" + dbg)
+            merged.extend(part)
+        elif key == "core_watchlist":
+            labels_short.append("My Core Watchlist")
+            merged.extend(CORE_WATCHLIST_TICKERS)
+        elif key == "burry_focus":
+            labels_short.append("Burry Mode Focus")
+            merged.extend(BURRY_FOCUS_TICKERS)
+        elif key == "auto_ev":
+            labels_short.append("Auto / EV Sector")
+            merged.extend(AUTO_EV_TICKERS)
+        elif key == "ai_tech":
+            labels_short.append("AI / Tech Volatility")
+            merged.extend(AI_TECH_TICKERS)
+        elif key == "energy_shipping":
+            labels_short.append("Energy / Shipping")
+            merged.extend(ENERGY_SHIPPING_TICKERS)
+
+    wide = _dedupe_tickers_preserve_order(merged)
+    tag = "multi:" + "+".join(selected_keys)
+    dbg_txt = "\n\n".join(debug_parts) if debug_parts else "(no FMP High-Vol call in selection)"
+    n = len(wide)
+    label_str = ", ".join(labels_short) if labels_short else "—"
+    summary = f"Scanned **{n}** tickers from **{label_str}**."
+    return wide, tag, dbg_txt, fmp_had_any, fmp_total_parsed, summary
 
 
 # -----------------------------------------------------------------------------
@@ -2382,8 +2437,8 @@ def main() -> None:
     keys = _env_keys()
     if not keys["fmp"]:
         st.warning(
-            "**FMP_API_KEY** is missing — `fmp_high_beta_universe` returns empty; discovery uses the **curated volatile "
-            "fallback**; P/E uses **yfinance** + SEC fallbacks. Add FMP for screener lists, peers, and ratios where your plan allows."
+            "**FMP_API_KEY** is missing — **High-Vol Discovery** returns no symbols; list-based universes still work. "
+            "Add FMP for screeners, peers, and ratios."
         )
 
     with st.sidebar:
@@ -2402,23 +2457,29 @@ def main() -> None:
     st.markdown('<span class="millenniallity-badge">@millenniallity</span>', unsafe_allow_html=True)
     st.title("Millenniallity Volatility Mismatch Scanner")
     st.markdown(
-        "**Pure discovery:** each run pulls a fresh **liquid** universe from **FMP**; if FMP list APIs return "
-        "**0** symbols (common on starter tiers), a **curated volatile fallback** list is used automatically. "
-        "Scores what to **investigate next** — not a watchlist you maintain here. "
-        "**Rich** P/E vs peers → **Buy Puts** bias; **cheap** mismatch → calls / stock. Air-gapped for **Public.com**."
+        "**Scan universes:** pick one or more below (combined & deduplicated). **High-Vol Discovery** uses **FMP** "
+        "(v3 then stable screener, limit **300**, **β>1.35**). Other rows are hardcoded theme lists. "
+        "**Burry Mode** adds scoring bias on top. **Rich** P/E vs peers → **Buy Puts** bias; **cheap** mismatch → calls / stock. "
+        "Air-gapped for **Public.com**."
     )
 
     burry_mode = st.checkbox(
         "Burry Mode",
         value=False,
         help=(
-            "Uses the Top 150 high-beta discovery universe and strengthens short-thesis signals "
-            "(extreme vs blended P/E, insider distribution, Bearish LLM)."
+            "Extra scoring weight for Burry-style setups (extreme vs blended P/E, insider distribution, Bearish LLM)."
         ),
     )
     st.caption(
         "**Burry Mode:** Strengthens signals for extreme overvalued shorts and deep value longs per Michael Burry's "
         "Cassandra Unchained approach."
+    )
+
+    selected_universes = st.multiselect(
+        "Scan Universe",
+        options=UNIVERSE_CHOICES_ORDER,
+        format_func=lambda k: UNIVERSE_CHOICES[k],
+        help="Select one or more. Tickers are merged in order and deduplicated.",
     )
 
     run = st.button("🚀 Run Auto Scanner — Find Volatile P/E Mismatches", type="primary", use_container_width=True)
@@ -2442,31 +2503,25 @@ def main() -> None:
         st.warning("**XAI_API_KEY** missing — narrative scoring disabled until set in `.env`.")
 
     if burry_mode:
-        st.success(
-            f"**Burry Mode on** — scanning **Top {BURRY_UNIVERSE_LIMIT}** high-beta discovery names (no manual ticker list)."
-        )
+        st.success("**Burry Mode on** — Burry-style scoring bias applied on top of your selected universes.")
 
-    uni_limit = BURRY_UNIVERSE_LIMIT if burry_mode else VOLATILE_UNIVERSE_LIMIT
-    wide, universe_source, fmp_universe_debug, fmp_universe_had_symbols, fmp_universe_n = (
-        build_discovery_universe(fmp_key, uni_limit)
-    )
+    if not selected_universes:
+        st.error("Select at least one **Scan Universe**.")
+        st.stop()
+
+    (
+        wide,
+        universe_source,
+        fmp_universe_debug,
+        fmp_universe_had_symbols,
+        fmp_universe_n,
+        discovery_summary_line,
+    ) = assemble_scan_universe(selected_universes, fmp_key)
     if not wide:
         st.error(
-            "**No discovery symbols.** FMP returned **0** and the **fallback list** could not be applied "
-            "(e.g. invalid limit). Normally, when FMP list endpoints are empty, the curated fallback runs automatically."
+            "**No tickers to scan.** If you only selected **High-Vol Discovery**, add **FMP_API_KEY** or pick a list-based universe."
         )
         st.stop()
-    if "stock_market" in universe_source:
-        st.info(
-            f"**Universe source:** `{universe_source}` — company **screener** returned no rows for your key/filters; "
-            "using **high-liquidity movers** instead (still fine for discovery). "
-            "For strict high-beta lists, check your FMP plan or API playground."
-        )
-    elif universe_source.startswith("fallback"):
-        st.info(
-            "**FMP screener returned 0 symbols** → using **fallback list** of curated volatile tickers "
-            f"(`{universe_source}`). Per-ticker ratios/peers still use FMP where your key allows."
-        )
     universe = sorted(set(wide))
     n_universe = len(universe)
 
@@ -2550,10 +2605,7 @@ def main() -> None:
             "Final counts for this run (live counters above were cleared). "
             "See **Debug / Errors** for FMP traces and per-ticker notes."
         )
-        if universe_source.startswith("fallback"):
-            st.info(
-                f"**FMP screener returned 0 symbols** → using **fallback list of {n_universe}** volatile tickers."
-            )
+        st.info(discovery_summary_line)
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Total tickers scanned", total_scanned)
         m2.metric("Passed volatility filter", n_vol_pass)
@@ -2567,9 +2619,8 @@ def main() -> None:
                 f"**{n_llm_ok}** LLM summaries · **0** final results."
             )
             st.info(
-                "**Suggestions:** Try **Burry Mode OFF** (narrower universe, different names), **Burry Mode ON** "
-                f"(Top {BURRY_UNIVERSE_LIMIT}), lower **`MIN_DISPLAY_SCORE`** in code, or verify your **FMP** key "
-                "(discovery + ratios), **SEC** / **xAI** keys, and the **Debug / Errors** section below."
+                "**Suggestions:** Try different **Scan Universe** combinations, toggle **Burry Mode**, lower "
+                f"**`MIN_DISPLAY_SCORE`** in code, or verify **FMP** / **SEC** / **xAI** keys and **Debug / Errors** below."
             )
 
     summary_records = []
@@ -2683,18 +2734,14 @@ def main() -> None:
             render_grok_followup_chat(r.ticker, r, xai_key)
 
     with st.expander("Debug / Errors", expanded=(n_final == 0)):
-        st.markdown("**Discovery: `fmp_high_beta_universe`**")
-        if universe_source.startswith("fallback"):
-            st.warning(
-                f"**FMP screener returned 0 symbols** → using **fallback list of {n_universe}** volatile tickers "
-                f"(`{universe_source}`)."
-            )
+        st.markdown("**Discovery: selected universes**")
+        st.markdown(f"- {discovery_summary_line}")
         st.markdown(
-            f"- **Returned any symbols:** **{'Yes' if fmp_universe_had_symbols else 'No'}** "
-            f"(count from FMP before fallback: **{fmp_universe_n}**)\n"
-            f"- **Universe source used for scan:** `{universe_source}` · **unique tickers scanned:** {total_scanned}"
+            f"- **FMP High-Vol returned symbols:** **{'Yes' if fmp_universe_had_symbols else 'No'}** "
+            f"(sum of parsed counts from screener attempts: **{fmp_universe_n}**)\n"
+            f"- **Universe tag:** `{universe_source}` · **unique tickers scanned:** {total_scanned}"
         )
-        st.markdown("**FMP HTTP trace (high-beta / movers attempts)**")
+        st.markdown("**FMP High-Vol screener attempts (per-call symbol counts + errors)**")
         st.code(fmp_universe_debug or "(empty)", language=None)
         st.markdown("**Stocks failing each major step** (this run)")
         st.markdown(
