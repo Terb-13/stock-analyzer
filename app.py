@@ -2430,16 +2430,17 @@ def main() -> None:
             )
 
         x_v, y_pe, z_llm, w_cur = _running_scan_counters(results, burry_mode=burry_mode)
+        passed_count = x_v  # cumulative tickers that passed the volatility filter
         progress.progress(
             (i + 1) / max(1, n_universe),
             text=(
                 f"Scanning {i + 1}/{n_universe} — {tick} | "
-                f"Passed so far: {x_v}"
+                f"Passed so far: {passed_count}"
             ),
         )
         live_stats.caption(
-            f"Passed volatility: **{x_v}** | P/E lookup OK: **{y_pe}** | LLM done: **{z_llm}** | "
-            f"Current results: **{w_cur}** (meets score ≥ {MIN_DISPLAY_SCORE})"
+            f"Passed volatility: {x_v} | P/E lookup OK: {y_pe} | LLM done: {z_llm} | "
+            f"Current results: {w_cur}"
         )
 
     progress.empty()
